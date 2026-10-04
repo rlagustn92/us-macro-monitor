@@ -284,6 +284,93 @@ def fetched_at():
     return pd.Timestamp.now(tz=KST)
 
 
+# ---------------------------------------------------------------- 사이드바 자동값
+@st.cache_data(ttl=3600, show_spinner=False)
+def cleveland_nowcast(target):
+    """클리블랜드 연준 인플레이션 나우캐스트 (매일 갱신). target = '2026-9' 형식의 대상 월.
+    반환: (CPI 전년비, 근원 전년비, 기준일 'MM/DD') — 해당 월 항목이 없으면 None"""
+    d = json.loads(_get("https://www.clevelandfed.org/-/media/files/webcharts/"
+                        "inflationnowcasting/nowcast_year.json?sc_lang=en", timeout=60)
+                   .lstrip("﻿"))
+    for e in d:
+        if e["chart"]["subcaption"] != target:
+            continue
+        def last(name):
+            # 날짜는 categories 대신 tooltext("CPI Inflation{br}10/02{br}3.6...")에서 읽음
+            # (categories엔 'PCE Aug' 같은 발표 표시가 섞여 있어 인덱스가 어긋남)
+            s = next(s for s in e["dataset"] if s["seriesname"] == name)["data"]
+            pts = [(x["tooltext"].split("{br}")[1], float(x["value"])) for x in s if x.get("value")]
+            return pts[-1] if pts else (None, None)
+
+        asof, cpi_now = last("CPI Inflation")
+        _, core_now = last("Core CPI Inflation")
+        return (cpi_now, core_now, asof) if cpi_now is not None else None
+    return None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def fomc_dates():
+    """연준 공식 FOMC 일정 페이지에서 결정일(회의 마지막 날) 목록."""
+    h = _get("https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
+    mon = {m: i for i, m in enumerate(
+        ["january", "february", "march", "april", "may", "june", "july", "august",
+         "september", "october", "november", "december"], 1)}
+    out = []
+    for ym in re.finditer(r"(\d{4}) FOMC Meetings", h):
+        nxt = h.find("FOMC Meetings", ym.end())
+        seg = h[ym.end(): nxt if nxt > 0 else None]
+        for m in re.finditer(r'fomc-meeting__month[^>]*>\s*<strong>([^<]+)</strong>'
+                             r'.*?fomc-meeting__date[^>]*>([^<]+)<', seg, re.S):
+            name = m.group(1).strip().split("/")[-1].lower()   # "Apr/May" -> may
+            days = re.findall(r"\d+", m.group(2))
+            if name in mon and days:
+                out.append(date(int(ym.group(1)), mon[name], int(days[-1])))
+    return sorted(set(out))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fed_target():
+    """뉴욕 연준 EFFR 이력에서 기준금리 목표 범위 변경 이력. [(적용일, 하단, 상단), ...]"""
+    start = date.today() - timedelta(days=800)
+    r = json.loads(_get("https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json"
+                        f"?startDate={start}&endDate={date.today()}"))
+    rows = sorted((x["effectiveDate"], x["targetRateFrom"], x["targetRateTo"])
+                  for x in r["refRates"])
+    changes, prev = [], None
+    for d, lo, hi in rows:
+        if prev is not None and (lo, hi) != prev:
+            changes.append((date.fromisoformat(d), lo, hi, hi - prev[1]))
+        prev = (lo, hi)
+    return changes, prev
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def spy_pe():
+    return yf.Ticker("SPY").info.get("trailingPE")
+
+
+def _fred_key():
+    try:
+        return st.secrets.get("FRED_API_KEY")
+    except Exception:          # secrets 파일 자체가 없을 때
+        return None
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def release_dates(key):
+    """다음 CPI / 고용보고서 발표일. FRED API 키가 있을 때만 (BLS 일정 페이지는 봇 차단).
+    FRED release id: 10 = CPI, 50 = Employment Situation"""
+    out = {}
+    for name, rid in (("CPI", 10), ("JOBS", 50)):
+        r = json.loads(_get(
+            "https://api.stlouisfed.org/fred/release/dates"
+            f"?release_id={rid}&api_key={key}&file_type=json&sort_order=asc"
+            f"&include_release_dates_with_no_data=true&realtime_start={date.today()}"))
+        ds = [date.fromisoformat(x["date"]) for x in r.get("release_dates", [])]
+        out[name] = next((d for d in ds if d >= date.today()), None)
+    return out
+
+
 def safe(fn, what, quiet=False):
     try:
         return fn()
@@ -323,27 +410,63 @@ with sb.expander("신호 임계값 (휴리스틱)"):
     th["stop_loss"] = st.number_input("레버리지 손절선 (%)", value=th["stop_loss"], step=1.0)
     th["take_profit"] = st.number_input("레버리지 익절 시작 (%)", value=th["take_profit"], step=1.0)
 
-fed_pause = sb.checkbox("연준 금리 인상 중단 시그널", value=False,
-                        help="🟢🟢 판정에 필요. 2026-09 인상 후 추가 인상 시사 중이라 기본 해제")
-nowcast = sb.number_input("클리블랜드 연준 나우캐스트: 다음 CPI 전년비 (%)", value=None,
-                          step=0.01, placeholder="예: 3.57")
-fwd_per = sb.number_input("S&P500 선행 PER", value=None, step=0.1, placeholder="예: 22.5",
-                          help="이익수익률(1/PER)과 10년물 비교에 사용")
+# ---- 아래 값들은 자동으로 채워짐. 사이드바에서 고치면 그 값이 우선 (새로고침하면 다시 자동값)
+today = date.today()
+mac = safe(macro, "CPI·실업률")
+fomc = safe(fomc_dates, "FOMC 일정", quiet=True) or FOMC
+
+# 연준 인상 중단: 마지막 금리 변경 이후 '동결한 FOMC'가 한 번이라도 있었나 (또는 마지막이 인하)
+pause_auto, pause_why = False, "자동 판정 실패 → 수동으로 체크"
+ft = safe(fed_target, "연준 기준금리", quiet=True)
+if ft and ft[0]:
+    (chg_d, lo, hi, step), _ = ft[0][-1], ft[1]
+    holds = [d for d in fomc if chg_d <= d <= today]
+    pause_auto = step < 0 or bool(holds)
+    pause_why = (f"자동: {chg_d:%Y-%m-%d} {step * 100:+.0f}bp {'인하' if step < 0 else '인상'} "
+                 f"(현재 {lo:.2f}~{hi:.2f}%) 후 " +
+                 (f"{holds[-1]:%m/%d} FOMC 동결" if holds else "아직 동결한 회의 없음"))
+fed_pause = sb.checkbox("연준 금리 인상 중단 시그널", value=pause_auto, help=pause_why)
+sb.caption(pause_why)
+
+# 나우캐스트: 다음 발표될 CPI(최신 발표월 + 1개월) 대상
+last_m = (mac[0]["CPI"].dropna().index[-1] if mac is not None
+          else pd.Timestamp(today.year, today.month, 1) - pd.DateOffset(months=2))
+target = last_m + pd.DateOffset(months=1)
+nc = safe(lambda: cleveland_nowcast(f"{target.year}-{target.month}"), "나우캐스트", quiet=True)
+nowcast = sb.number_input(
+    f"나우캐스트: {target:%Y.%m} CPI 전년비 (%)", step=0.01, placeholder="예: 3.57",
+    value=round(nc[0], 2) if nc else None,
+    help="클리블랜드 연준 인플레이션 나우캐스트 (매일 갱신)")
+sb.caption(f"자동: 클리블랜드 연준 {nc[2]} 기준 · 근원 {nc[1]:.2f}%" if nc
+           else "자동 수신 실패 → 직접 입력")
+
+pe = safe(spy_pe, "PER", quiet=True)
+fwd_per = sb.number_input("S&P500 PER", value=round(pe, 1) if pe else None, step=0.1,
+                          placeholder="예: 22.5",
+                          help="이익수익률(1/PER)과 10년물 비교. 선행 PER을 알면 덮어쓰기")
+sb.caption("자동: SPY 후행 PER (무료로 받을 수 있는 선행 PER 출처가 없음)" if pe
+           else "자동 수신 실패 → 직접 입력")
 
 with sb.expander("레버리지 진입가 (손절·익절 점검)"):
     entries = {t: st.number_input(f"{t} 진입가 ($)", value=None, step=0.01, key=f"entry_{t}")
                for t in LEVERAGE}
 
 with sb.expander("다음 이벤트 일정"):
-    today = date.today()
+    key = _fred_key()
+    rel = safe(lambda: release_dates(key), "발표 일정", quiet=True) if key else None
     first_fri = lambda y, m: date(y, m, 1) + timedelta(days=(4 - date(y, m, 1).weekday()) % 7)
     jobs = first_fri(today.year, today.month)
     if jobs < today:
         nm = date(today.year + today.month // 12, today.month % 12 + 1, 1)
         jobs = first_fri(nm.year, nm.month)
-    ev_cpi = st.date_input("다음 CPI 발표", value=NEXT_CPI if NEXT_CPI >= today else None)
-    ev_jobs = st.date_input("다음 고용보고서 (첫째 금요일 추정)", value=jobs)
-    ev_fomc = st.date_input("다음 FOMC 결정", value=next((d for d in FOMC if d >= today), None))
+    cpi_d = (rel or {}).get("CPI") or (NEXT_CPI if NEXT_CPI >= today else None)
+    ev_cpi = st.date_input("다음 CPI 발표", value=cpi_d)
+    ev_jobs = st.date_input("다음 고용보고서", value=(rel or {}).get("JOBS") or jobs)
+    ev_fomc = st.date_input("다음 FOMC 결정", value=next((d for d in fomc if d >= today), None))
+    st.caption("FOMC: 연준 공식 일정에서 자동  \n" + (
+        "CPI·고용보고서: FRED에서 자동" if rel else
+        "CPI·고용보고서: FRED API 키를 넣으면 자동 (없으면 고용은 첫째 금요일로 추정, "
+        "CPI는 직접 입력)"))
 
 with sb.expander("반도체 종목"):
     semi_txt = st.text_input("ETF + 종목 (쉼표로 구분)", ", ".join(SEMI_ETFS + SEMI_STOCKS))
@@ -353,7 +476,6 @@ semi_list = tuple(dict.fromkeys(t.strip().upper() for t in semi_txt.split(",") i
 # ================================================================
 # 지표 조립 + 신호 판정
 # ================================================================
-mac = safe(macro, "CPI·실업률")
 curve = safe(treasury, "재무부 수익률")
 daily = safe(yf_daily, "시세")
 
@@ -548,7 +670,7 @@ with tabs[0]:
                        else "이익수익률 ≥ 10년물 → 주식 상대 매력 유지")
         else:
             st.markdown("⚪ **주식 이익수익률 vs 10년물**")
-            st.caption("사이드바에 S&P500 선행 PER을 넣으면 계산")
+            st.caption("사이드바에 S&P500 PER을 넣으면 계산")
     with a3.container(border=True):
         st.markdown("**🟢에서 산 물량 청산 조건** (하나라도 나오면)")
         st.caption("  \n".join(f"{mr.ok(hit)} {txt}" for hit, txt in mr.exit_check(ind, th)))
@@ -805,7 +927,7 @@ with tabs[6]:
 - 숫자 기준(3.5%, 5.0%, 4.7%, 3.0% 등)은 전부 대화에서 정한 휴리스틱이며 사이드바에서 바꿀 수 있다.
 
 ### 데이터 출처
-Yahoo Finance (시세, 약 10~15분 지연) · U.S. Treasury (수익률 곡선, TIPS) · BLS (CPI, 실업률) / 실패 시 FRED
+Yahoo Finance (시세, 약 10~15분 지연, SPY PER) · U.S. Treasury (수익률 곡선, TIPS) · BLS (CPI, 실업률) / 실패 시 FRED · 클리블랜드 연준 (인플레이션 나우캐스트) · 연준 (FOMC 일정) · 뉴욕 연준 (기준금리 목표 범위) · FRED API (CPI·고용보고서 발표일, 키 필요)
 """)
 
 st.divider()

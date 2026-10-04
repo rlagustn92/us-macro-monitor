@@ -10,3 +10,4 @@ __pycache__/
 *.bat
 .claude/
 macro_monitor_spec.md
+.streamlit/secrets.toml
