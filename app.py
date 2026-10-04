@@ -23,6 +23,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+import history
 import macro_rules as mr
 import nasdaq_tripod as tp
 
@@ -35,6 +36,7 @@ KST = "Asia/Seoul"
 RT_YIELDS = {"^IRX": "3개월", "^FVX": "5년", "^TNX": "10년", "^TYX": "30년"}
 WTI, SOX = "CL=F", "^SOX"
 LEVERAGE = ["SOXL", "TQQQ"]
+LONG_ASSETS = {"^GSPC": "S&P500", "^NDX": "나스닥100", "^SOX": "반도체(SOX)"}
 
 SEMI_ETFS = ["SOXL", "SOXX", "SMH"]
 SEMI_STOCKS = ["NVDA", "AVGO", "TSM", "AMD", "MU", "ASML", "AMAT", "LRCX", "QCOM", "INTC"]
@@ -129,6 +131,24 @@ def mark_extrema(fig, s, slot=0):
             marker=dict(size=10, color=c["series"][slot], line=dict(width=2, color=c["surface"]))))
         fig.add_annotation(x=ts, y=s[ts], yshift=dy, showarrow=False,
                            text=f"{lab} {s[ts]:.1f}%", font=dict(size=11, color=c["text2"]))
+    return fig
+
+
+def bar_chart(s, height=300, yfmt="+.2f", xlab="", hover_x=""):
+    """단일 계열 막대 (양/음 같은 색, 0 기준선). s.index = x"""
+    c = theme()
+    fig = go.Figure(go.Bar(
+        x=list(s.index), y=s.values, marker=dict(color=c["series"][0], line=dict(width=0)),
+        hovertemplate=f"{hover_x}%{{x}}<br>%{{y:{yfmt}}}<extra></extra>"))
+    fig.add_hline(y=0, line=dict(color=c["axis"], width=1))
+    fig.update_layout(
+        height=height, margin=dict(l=8, r=8, t=16, b=8), bargap=0.25,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family='system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif',
+                  color=c["text2"], size=12),
+        hoverlabel=dict(bgcolor=c["surface"], font_color=c["text"], bordercolor=c["border"]),
+        xaxis=dict(title=xlab, showgrid=False, linecolor=c["axis"], tickfont=dict(color=c["muted"])),
+        yaxis=dict(gridcolor=c["grid"], zeroline=False, tickfont=dict(color=c["muted"])))
     return fig
 
 
@@ -234,7 +254,7 @@ def treasury(kind="daily_treasury_yield_curve", years=3):
     return df[sorted(df.columns)].apply(pd.to_numeric, errors="coerce")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3 * 3600, show_spinner=False)   # BLS 무료 API 하루 25회 제한 -> 3시간
 def macro():
     """월간 지표. 1순위 BLS, 실패하면 FRED.
     CPI·근원 = 원계열(전년비용, BLS 발표 기준) / _SA = 계절조정(전월비용) / 실업률 = 계절조정"""
@@ -268,6 +288,59 @@ def macro():
         return df[df.index >= pd.Timestamp(this - 5, 1, 1)], "FRED"
 
 
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def cpi_history():
+    """시차 분석용 장기 CPI 지수 (원계열, 1986~). PeriodIndex('M').
+    FRED 키가 있으면 FRED 한 번에, 없으면 BLS를 10년씩 나눠서 (v1 한 번에 10년 제한)."""
+    key = _fred_key()
+    if key:
+        r = json.loads(_get("https://api.stlouisfed.org/fred/series/observations"
+                            f"?series_id=CPIAUCNS&api_key={key}&file_type=json"
+                            "&observation_start=1986-01-01"))
+        s = pd.Series({pd.Period(o["date"][:7], "M"): pd.to_numeric(o["value"], errors="coerce")
+                       for o in r["observations"]})
+        return s.sort_index(), "FRED"
+    try:
+        pts, this = {}, date.today().year
+        for a in range(1986, this + 1, 10):
+            body = json.dumps({"seriesid": ["CUUR0000SA0"], "startyear": str(a),
+                               "endyear": str(min(a + 9, this))}).encode()
+            res = json.loads(_get("https://api.bls.gov/publicAPI/v1/timeseries/data/",
+                                  data=body, headers={"Content-Type": "application/json"}))
+            if res.get("status") != "REQUEST_SUCCEEDED":
+                raise RuntimeError(res.get("message"))
+            for p in res["Results"]["series"][0]["data"]:
+                if p["period"].startswith("M") and p["period"] != "M13":
+                    pts[pd.Period(year=int(p["year"]), month=int(p["period"][1:]), freq="M")] = \
+                        pd.to_numeric(p["value"], errors="coerce")
+        return pd.Series(pts, dtype=float).sort_index(), "BLS"
+    except Exception:   # BLS 하루 한도 초과 등 -> FRED 공개 CSV (키 불필요)
+        d = pd.read_csv(io.StringIO(_get(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCNS&cosd=1986-01-01",
+            timeout=20)))
+        s = pd.to_numeric(d.iloc[:, 1], errors="coerce")
+        s.index = pd.PeriodIndex(pd.to_datetime(d.iloc[:, 0]), freq="M")
+        return s, "FRED"
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def monthly_px():
+    """S&P500 · 나스닥100 · 반도체 · 10년물 월말 종가 (가능한 전체 기간). PeriodIndex('M')."""
+    df = _close(yf.download(list(LONG_ASSETS) + ["^TNX"], period="max", interval="1mo",
+                            progress=False, auto_adjust=False))
+    df.index = pd.to_datetime(df.index).tz_localize(None).to_period("M")
+    return df[~df.index.duplicated(keep="last")]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def daily_px_since_2013():
+    """CPI 발표일 반응 계산용 일봉 (나우캐스트 기록이 2013-08부터)."""
+    df = _close(yf.download(list(LONG_ASSETS) + ["^TNX"], start="2013-07-01", interval="1d",
+                            progress=False, auto_adjust=False))
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def tripod_data():
     df = _close(yf.download(["^NDX", "^VIX"], period="10y", interval="1d",
@@ -286,13 +359,17 @@ def fetched_at():
 
 # ---------------------------------------------------------------- 사이드바 자동값
 @st.cache_data(ttl=3600, show_spinner=False)
+def nowcast_raw():
+    """클리블랜드 연준 인플레이션 나우캐스트 원본 (2013-08~, 대상월별 일간 예측치 + 실제치)."""
+    return json.loads(_get("https://www.clevelandfed.org/-/media/files/webcharts/"
+                           "inflationnowcasting/nowcast_year.json?sc_lang=en", timeout=60)
+                      .lstrip("﻿"))
+
+
 def cleveland_nowcast(target):
-    """클리블랜드 연준 인플레이션 나우캐스트 (매일 갱신). target = '2026-9' 형식의 대상 월.
+    """target = '2026-9' 형식의 대상 월.
     반환: (CPI 전년비, 근원 전년비, 기준일 'MM/DD') — 해당 월 항목이 없으면 None"""
-    d = json.loads(_get("https://www.clevelandfed.org/-/media/files/webcharts/"
-                        "inflationnowcasting/nowcast_year.json?sc_lang=en", timeout=60)
-                   .lstrip("﻿"))
-    for e in d:
+    for e in nowcast_raw():
         if e["chart"]["subcaption"] != target:
             continue
         def last(name):
@@ -464,7 +541,7 @@ with sb.expander("다음 이벤트 일정"):
     ev_jobs = st.date_input("다음 고용보고서", value=(rel or {}).get("JOBS") or jobs)
     ev_fomc = st.date_input("다음 FOMC 결정", value=next((d for d in fomc if d >= today), None))
     st.caption("FOMC: 연준 공식 일정에서 자동  \n" + (
-        "CPI·고용보고서: FRED에서 자동" if rel else
+        "CPI·고용보고서: FRED에서 자동" if rel and all(rel.values()) else
         "CPI·고용보고서: FRED API 키를 넣으면 자동 (없으면 고용은 첫째 금요일로 추정, "
         "CPI는 직접 입력)"))
 
@@ -560,11 +637,12 @@ um = f" ({unrate.index[-1]:%Y.%m})" if hasattr(unrate.index[-1], "strftime") els
 cols[5].metric(f"실업률{um}", f"{unrate.iloc[-1]:.1f}%",
                f"{unrate.iloc[-1] - unrate.iloc[-2]:+.1f}%p", delta_color="off", border=True)
 
-tabs = st.tabs(["🧭 신호 판정", "국채 금리", "물가·고용", "반도체", "WTI 유가",
-                "나스닥 트라이팟", "도움말"])
+(t_signal, t_lag, t_surp, t_rate, t_infl, t_semi, t_oil, t_tri, t_help) = st.tabs(
+    ["🧭 신호 판정", "📊 시차 분석", "🎯 CPI 서프라이즈", "국채 금리", "물가·고용", "반도체",
+     "WTI 유가", "나스닥 트라이팟", "도움말"])
 
 # ---------------------------------------------------------------- 신호 판정
-with tabs[0]:
+with t_signal:
     # ② 현재 액션 카드 (스펙 6-3)
     st.subheader(f"지금 할 일 — {mr.STAGES[stage]['icon']} {mr.STAGES[stage]['label']}")
     act = mr.ACTIONS[stage]
@@ -690,8 +768,202 @@ with tabs[0]:
                 st.markdown(f"⚪ **{t}**" + (f" \\${px:,.2f}" if px else ""))
                 st.caption("사이드바 '레버리지 진입가'에 입력하면 손절선/익절 구간 표시")
 
+# ---------------------------------------------------------------- 시차 분석
+def _ts(s):
+    """PeriodIndex -> 월초 Timestamp (plotly용)"""
+    s = s.copy()
+    s.index = s.index.to_timestamp()
+    return s
+
+
+with t_lag:
+    st.markdown("지표가 정점을 찍거나 튄 뒤 주가가 **몇 개월 뒤에** 반응했는지 과거 데이터로 봅니다. "
+                "정점 사례가 5~9번뿐이라 **경향을 보는 용도**이지 규칙이 아닙니다.")
+    hist = safe(cpi_history, "장기 CPI")
+    mpx = safe(monthly_px, "장기 시세")
+    if hist is not None and mpx is not None:
+        cpi_idx, hsrc = hist
+        IND = {  # 이름: (시계열, 정점 조건)
+            "CPI 전년비": ((cpi_idx.pct_change(12, fill_method=None) * 100).dropna(),
+                         dict(min_level=3.0, min_drop=1.0)),
+            "10년물 금리": (mpx["^TNX"].dropna().loc[pd.Period("1987-01", "M"):],
+                         dict(min_drop=0.75)),
+        }
+        c1, c2 = st.columns(2)
+        ind_name = c1.segmented_control("지표", list(IND), default="CPI 전년비",
+                                        key="lag_ind") or "CPI 전년비"
+        asset = c2.segmented_control("자산", list(LONG_ASSETS), default="^SOX", key="lag_asset",
+                                     format_func=LONG_ASSETS.get) or "^SOX"
+        x, kw = IND[ind_name]
+        pa = mpx[asset].dropna()
+        peaks = history.find_peaks(x, 12, **kw)
+        cur = history.latest_peak(x, 12, kw["min_drop"] * 0.5)
+        if cur in peaks:
+            cur = None
+
+        # 위: 지표 + 정점 / 아래: 자산 (같은 기간, 정점 세로선)
+        cth = theme()
+
+        def add_peak_lines(fig, on=None):
+            for p in peaks + ([cur] if cur else []):
+                fig.add_vline(x=p.to_timestamp(), line=dict(color=cth["muted"], width=1,
+                                                             dash="dash" if p == cur else "dot"))
+                if on is not None:
+                    fig.add_trace(go.Scatter(
+                        x=[p.to_timestamp()], y=[on[p]], mode="markers", showlegend=False,
+                        hovertemplate=f"{'잠정 ' if p == cur else ''}정점 {p}<br>%{{y:.2f}}%<extra></extra>",
+                        marker=dict(size=10, color=cth["series"][0],
+                                    line=dict(width=2, color=cth["surface"]))))
+            return fig
+
+        st.markdown(f"**{ind_name}** · 점 = 정점 (점선 세로줄), 파선 = 아직 확정 안 된 최근 정점")
+        show(add_peak_lines(line_chart([(ind_name, _ts(x))], height=250), on=x))
+        st.markdown(f"**{LONG_ASSETS[asset]}** (로그 스케일, 같은 세로줄)")
+        f2 = add_peak_lines(line_chart([(LONG_ASSETS[asset], _ts(pa.loc[x.index[0]:]))],
+                                       ysuffix="", yfmt=",.0f", height=250))
+        f2.update_yaxes(type="log")
+        show(f2)
+
+        rows = []
+        for p in peaks + ([cur] if cur else []):
+            r = history.after_peak(pa, p)
+            if r is None:
+                rows.append({"지표 정점": str(p), "정점 값": x[p], "비고": "자산 데이터 없음"})
+                continue
+            rows.append({
+                "지표 정점": str(p), "정점 값": x[p],
+                "주가 고점 (정점 대비)": r["top_offset"],
+                "바닥까지 (개월)": r["months_to_trough"],
+                "정점 대비 최저": r["drawdown"], "6개월 뒤": r["ret6"], "12개월 뒤": r["ret12"],
+                "비고": "잠정 (진행 중)" if p == cur else ("" if r["complete"] else "24개월 미경과"),
+            })
+        tbl = pd.DataFrame(rows)
+        pct = st.column_config.NumberColumn(format="%+.1f%%")
+        st.dataframe(tbl, hide_index=True, width="stretch", column_config={
+            "정점 값": st.column_config.NumberColumn(format="%.2f%%"),
+            "주가 고점 (정점 대비)": st.column_config.NumberColumn(
+                format="%+d개월", help="정점 앞뒤 12개월 중 주가 최고점 시점. 음수 = 주가가 먼저 꺾임"),
+            "정점 대비 최저": pct, "6개월 뒤": pct, "12개월 뒤": pct})
+
+        # 요약은 확정된(24개월 지난) 정점만
+        done = (tbl[(tbl["비고"] == "") & tbl["바닥까지 (개월)"].notna()]
+                if "바닥까지 (개월)" in tbl else tbl.iloc[0:0])
+        if len(done):
+            fell = done[done["정점 대비 최저"] < -10]
+            st.info(
+                f"확정된 정점 {len(done)}번 기준 · 주가 고점은 정점 대비 중간값 "
+                f"**{done['주가 고점 (정점 대비)'].median():+.0f}개월** "
+                f"(음수 = 주가가 먼저 꺾임) · 정점 후 24개월 내 바닥까지 중간값 "
+                f"**{done['바닥까지 (개월)'].median():.0f}개월** · "
+                f"10% 넘게 빠진 경우 **{len(fell)}번** "
+                f"({', '.join(fell['지표 정점']) or '없음'}) · 12개월 뒤 수익률 중간값 "
+                f"**{done['12개월 뒤'].median():+.1f}%**")
+
+        st.markdown(f"**시차별 상관계수** — {ind_name} 6개월 변화 vs L개월 뒤부터 3개월간 "
+                    f"{LONG_ASSETS[asset]} 수익률")
+        corr = history.lag_corr(x.diff(6), pa, lags=range(-12, 25), fwd=3)
+        show(bar_chart(corr, xlab="L (개월) · 음수 = 주가가 지표보다 먼저 움직임",
+                       hover_x="L = "))
+        after, before = corr[corr.index >= 0], corr[corr.index < 0]
+        st.caption(
+            f"지표가 오른 뒤 주가가 가장 약했던 시점: **{after.idxmin()}개월 뒤** "
+            f"(상관 {after.min():+.2f}) · 주가 선행이 가장 강한 시점: **{-before.abs().idxmax()}개월 전** "
+            f"(상관 {before[before.abs().idxmax()]:+.2f}) · ±0.2 안쪽은 약한 관계이고, "
+            f"겹치는 구간으로 계산해서 실제보다 강해 보일 수 있음 · CPI 출처 {hsrc}")
+
+# ---------------------------------------------------------------- CPI 서프라이즈
+with t_surp:
+    raw = safe(nowcast_raw, "나우캐스트 기록")
+    dpx = safe(daily_px_since_2013, "발표일 시세")
+    if raw is not None and dpx is not None:
+        sp = history.surprises(raw)
+        for t in LONG_ASSETS:
+            sp[t] = history.release_reaction(dpx[t].dropna(), sp["release"]).values
+        tnx = dpx["^TNX"].dropna()
+        sp["10년물"] = [(tnx.iloc[tnx.index.get_loc(d)] - tnx.iloc[tnx.index.get_loc(d) - 1]) * 100
+                       if d in tnx.index else None for d in sp["release"]]
+
+        st.markdown("CPI 발표 때마다 **발표 직전 예상치**(클리블랜드 연준 나우캐스트)와 **실제치**의 차이, "
+                    "그리고 그날 시장 반응입니다. 시장은 숫자 자체보다 **예상과의 차이**에 반응합니다.")
+        last = sp.iloc[-1]
+        m = st.columns(4)
+        m[0].metric(f"다음 발표 {ev_cpi:%m/%d}" if ev_cpi else "다음 발표",
+                    f"{nowcast:.2f}%" if nowcast is not None else "-",
+                    f"{target:%Y.%m} CPI 예상 (나우캐스트)", delta_color="off", border=True)
+        m[1].metric(f"직전 발표 {last.release:%Y-%m-%d} ({last.target})",
+                    f"{last.surprise:+.2f}%p", f"예상 {last.nowcast:.2f}% → 실제 {last.actual:.2f}%",
+                    delta_color="off", border=True)
+        m[2].metric("평균 서프라이즈 크기", f"{sp.surprise.abs().mean():.2f}%p",
+                    f"{len(sp)}회 발표 (2013.09~)", delta_color="off", border=True)
+        m[3].metric("직전 발표일 SOX", f"{last['^SOX']:+.2f}%" if pd.notna(last["^SOX"]) else "-",
+                    f"S&P500 {last['^GSPC']:+.2f}% · 10년물 {last['10년물']:+.0f}bp"
+                    if pd.notna(last["^GSPC"]) else "", delta_color="off", border=True)
+
+        per = st.segmented_control(
+            "기간", ["전체 (2013~)", "고물가 시대 (2021~)"], default="전체 (2013~)",
+            key="surp_per") or "전체 (2013~)"
+        if per.startswith("고물가"):
+            sp = sp[sp.release >= "2021-01-01"].reset_index(drop=True)
+
+        band = 0.1
+        sp["구분"] = pd.cut(sp.surprise, [-99, -band, band, 99],
+                          labels=[f"예상보다 낮음 (≤ −{band}%p)", f"예상 근처 (±{band}%p)",
+                                  f"예상보다 높음 (≥ +{band}%p)"])
+        grp = sp.groupby("구분", observed=False).agg(
+            횟수=("surprise", "size"), **{n: (t, "mean") for t, n in LONG_ASSETS.items()},
+            **{"10년물 (bp)": ("10년물", "mean")}).reset_index()
+        st.markdown("**서프라이즈 방향별 발표 당일 평균 반응**")
+        pct = st.column_config.NumberColumn(format="%+.2f%%")
+        st.dataframe(grp, hide_index=True, width="stretch", column_config={
+            **{n: pct for n in LONG_ASSETS.values()},
+            "10년물 (bp)": st.column_config.NumberColumn(format="%+.1f")})
+
+        pick = st.segmented_control("산점도 자산", list(LONG_ASSETS), default="^SOX",
+                                    format_func=LONG_ASSETS.get, key="surp_asset") or "^SOX"
+        d = sp.dropna(subset=[pick])
+        cth = theme()
+        fig = go.Figure(go.Scatter(
+            x=d.surprise, y=d[pick], mode="markers",
+            customdata=list(zip(d.release.dt.strftime("%Y-%m-%d"), d.target.astype(str))),
+            hovertemplate="%{customdata[0]} (%{customdata[1]}분)<br>서프라이즈 %{x:+.2f}%p"
+                          "<br>당일 %{y:+.2f}%<extra></extra>",
+            marker=dict(size=9, color=cth["series"][0], opacity=0.8,
+                        line=dict(width=1, color=cth["surface"]))))
+        fig.add_hline(y=0, line=dict(color=cth["axis"], width=1))
+        fig.add_vline(x=0, line=dict(color=cth["axis"], width=1))
+        fig.update_layout(
+            height=380, margin=dict(l=70, r=8, t=16, b=56),   # 축 제목 공간
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(family='system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif',
+                      color=cth["text2"], size=12),
+            hoverlabel=dict(bgcolor=cth["surface"], font_color=cth["text"]),
+            xaxis=dict(title="서프라이즈 (실제 − 예상, %p)", showgrid=False, zeroline=False,
+                       linecolor=cth["axis"], tickfont=dict(color=cth["muted"])),
+            yaxis=dict(title=f"{LONG_ASSETS[pick]} 발표 당일 (%)", gridcolor=cth["grid"],
+                       zeroline=False, tickfont=dict(color=cth["muted"]), ticksuffix="%"))
+        st.markdown(f"**서프라이즈 vs {LONG_ASSETS[pick]} 당일 수익률** (점 하나 = 발표 한 번)")
+        show(fig)
+        st.caption(f"상관계수 {d.surprise.corr(d[pick]):+.2f} · 오른쪽 아래(예상보다 높고 주가 하락)에 "
+                   "몰려 있을수록 '물가 서프라이즈에 민감한' 시장 · 예상치는 시장 컨센서스(이코노미스트 "
+                   "설문)가 아니라 나우캐스트라서 실제 시장 기대와는 차이가 있을 수 있음")
+
+        with st.expander(f"발표별 기록 (최근 {min(36, len(sp))}회)"):
+            show_t = sp.iloc[::-1].head(36).assign(
+                발표일=lambda f: f.release.dt.strftime("%Y-%m-%d"),
+                대상월=lambda f: f.target.astype(str))
+            st.dataframe(show_t[["발표일", "대상월", "nowcast", "actual", "surprise",
+                                 *LONG_ASSETS, "10년물"]].rename(columns={
+                                     "nowcast": "예상", "actual": "실제", "surprise": "서프라이즈",
+                                     **LONG_ASSETS, "10년물": "10년물 (bp)"}),
+                         hide_index=True, width="stretch", column_config={
+                             "예상": st.column_config.NumberColumn(format="%.2f%%"),
+                             "실제": st.column_config.NumberColumn(format="%.2f%%"),
+                             "서프라이즈": st.column_config.NumberColumn(format="%+.2f%%p"),
+                             **{n: pct for n in LONG_ASSETS.values()},
+                             "10년물 (bp)": st.column_config.NumberColumn(format="%+.1f")})
+
 # ---------------------------------------------------------------- 국채 금리
-with tabs[1]:
+with t_rate:
     @st.fragment
     def rate_intraday():
         intra = safe(yf_intraday, "장중 시세")
@@ -750,7 +1022,7 @@ with tabs[1]:
                 column_config={"수익률(%)": st.column_config.NumberColumn(format="%.2f")})
 
 # ---------------------------------------------------------------- 물가·고용
-with tabs[2]:
+with t_infl:
     real = safe(lambda: treasury("daily_treasury_real_yield_curve"), "TIPS 실질금리")
     c = st.columns(5)
     if mac is not None:
@@ -786,7 +1058,7 @@ with tabs[2]:
         st.caption("출처: 미 재무부 · 명목금리 − TIPS 실질금리")
 
 # ---------------------------------------------------------------- 반도체
-with tabs[3]:
+with t_semi:
     sm = safe(lambda: semis(semi_list), "반도체 시세")
     if sm is not None:
         px = sm.ffill()
@@ -852,7 +1124,7 @@ with tabs[3]:
                       help="음수일수록 '금리 오르는 날 반도체 빠지는' 관계가 강함")
 
 # ---------------------------------------------------------------- WTI
-with tabs[4]:
+with t_oil:
     intra = safe(yf_intraday, "장중 시세")
     if intra is not None:
         s = intra[WTI].dropna()
@@ -866,7 +1138,7 @@ with tabs[4]:
         st.caption("근월물 선물(CL=F) 기준, 달러/배럴 · 만기 교체일엔 가격이 튈 수 있음")
 
 # ---------------------------------------------------------------- 트라이팟
-with tabs[5]:
+with t_tri:
     raw = safe(tripod_data, "NDX/VIX")
     if raw is not None:
         out = tp.build(raw)
@@ -905,7 +1177,7 @@ with tabs[5]:
             st.code(tp.RULES_TEXT, language=None)
 
 # ---------------------------------------------------------------- 도움말 (스펙 9장)
-with tabs[6]:
+with t_help:
     st.markdown("""
 ### 프레임워크 요약
 - **저물가 시대 → 실업률이 왕.** 실업률이 바닥 찍고 오르면 매도, 정점 찍고 내려오면 매수.
