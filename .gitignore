@@ -9,3 +9,4 @@ tripod_meta.json
 __pycache__/
 *.bat
 .claude/
+macro_monitor_spec.md
