@@ -1,0 +1,11 @@
+# 공개 저장소에는 코드만 올림 — 개인 파일 제외
+*.xlsx
+*.zip
+*.txt
+!requirements.txt
+인수인계.md
+tripod_data.csv
+tripod_meta.json
+__pycache__/
+*.bat
+.claude/
