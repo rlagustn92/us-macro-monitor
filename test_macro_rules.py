@@ -81,3 +81,33 @@ def test_leverage():
     assert leverage_check(80, 100, TH)[1] == "STOP"
     assert leverage_check(112, 100, TH)[1] == "TAKE"
     assert leverage_check(100, 100, TH)[1] is None
+
+
+# ---------------------------------------------------------------- 쉬운 말 해석
+from macro_rules import next_cpi_outcomes, plain_summary, stage_triggers  # noqa: E402
+
+
+def test_plain_summary_snapshot():
+    s = plain_summary(ind(nowcast=3.60), TH, "YELLOW", "HIGH")
+    assert s["headline"] == "기다리는 구간"
+    assert "물가 3.4% — 높음, 제자리, 다음엔 오를 조짐" in s["reasons"][0]
+    assert "정점 4.2%" in s["reasons"][0]
+    assert "고점 5.34%까지 0.06%p" in s["reasons"][1]
+
+
+def test_next_cpi_outcomes_snapshot():
+    """스펙 4-3: 3.5% 이상이면 🟠, 그 아래는 🟡 유지 (🟢는 2개월 연속 하락 + 금리 5% 아래 필요)"""
+    assert next_cpi_outcomes(ind(), TH) == [("3.4% 이하", "YELLOW"), ("3.5% 이상", "ORANGE")]
+
+
+def test_next_cpi_outcomes_three_groups():
+    """금리가 5% 아래이고 이미 1개월 하락했으면, 한 번 더 내리면 🟢"""
+    o = next_cpi_outcomes(ind(cpi=CPI_2026 + [3.3], y10=4.9), TH)
+    assert o[0] == ("3.2% 이하", "GREEN") and o[-1] == ("3.5% 이상", "ORANGE")
+
+
+def test_stage_triggers_distance():
+    t = {x["stage"]: x for x in stage_triggers(ind(), TH, "HIGH")}
+    assert [m for _, m, _ in t["RED"]["conds"]] == [False, False]
+    assert "0.06%p 남음" in t["RED"]["conds"][1][2]
+    assert "0.28%p 내려와야" in t["GREEN"]["conds"][1][2]

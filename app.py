@@ -108,11 +108,11 @@ def line_chart(series, ysuffix="%", height=320, yfmt=".2f", label_ends=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title=None,
                     font=dict(color=c["text2"])),
         xaxis=dict(showgrid=False, linecolor=c["axis"], tickfont=dict(color=c["muted"]),
-                   type="category" if xcat else None,
+                   type="category" if xcat else None, automargin=True,
                    showspikes=True, spikemode="across", spikecolor=c["axis"],
                    spikethickness=1, spikedash="solid"),
         yaxis=dict(gridcolor=c["grid"], gridwidth=1, zeroline=False,
-                   tickfont=dict(color=c["muted"]), ticksuffix=ysuffix),
+                   tickfont=dict(color=c["muted"]), ticksuffix=ysuffix, automargin=True),
     )
     if intraday:   # 장 닫힌 시간(밤·주말)을 접어서 거래 구간만 이어 붙임
         idx = series[0][1].index
@@ -134,7 +134,7 @@ def mark_extrema(fig, s, slot=0):
     return fig
 
 
-def bar_chart(s, height=300, yfmt="+.2f", xlab="", hover_x=""):
+def bar_chart(s, height=340, yfmt="+.2f", xlab="", ylab="", hover_x=""):
     """단일 계열 막대 (양/음 같은 색, 0 기준선). s.index = x"""
     c = theme()
     fig = go.Figure(go.Bar(
@@ -142,13 +142,15 @@ def bar_chart(s, height=300, yfmt="+.2f", xlab="", hover_x=""):
         hovertemplate=f"{hover_x}%{{x}}<br>%{{y:{yfmt}}}<extra></extra>"))
     fig.add_hline(y=0, line=dict(color=c["axis"], width=1))
     fig.update_layout(
-        height=height, margin=dict(l=8, r=8, t=16, b=8), bargap=0.25,
+        height=height, margin=dict(l=60, r=16, t=28, b=64), bargap=0.25,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family='system-ui, -apple-system, "Segoe UI", "Malgun Gothic", sans-serif',
                   color=c["text2"], size=12),
         hoverlabel=dict(bgcolor=c["surface"], font_color=c["text"], bordercolor=c["border"]),
-        xaxis=dict(title=xlab, showgrid=False, linecolor=c["axis"], tickfont=dict(color=c["muted"])),
-        yaxis=dict(gridcolor=c["grid"], zeroline=False, tickfont=dict(color=c["muted"])))
+        xaxis=dict(title=dict(text=xlab, standoff=12), showgrid=False, linecolor=c["axis"],
+                   tickfont=dict(color=c["muted"]), automargin=True, dtick=3),
+        yaxis=dict(title=ylab, gridcolor=c["grid"], zeroline=False, tickformat="+.2f",
+                   tickfont=dict(color=c["muted"]), automargin=True))
     return fig
 
 
@@ -159,6 +161,65 @@ def show(fig):
 def bp(x):
     """%p 단위 차이 -> bp (0.04 -> +4bp)"""
     return f"{x * 100:+.0f}bp"
+
+
+# ---------------------------------------------------------------- 한눈에 보기 부품
+ZONE_RGB = {"good": "12,163,12", "warning": "250,178,25", "serious": "236,131,90",
+            "critical": "208,59,59", "neutral": "127,127,127"}
+ZONE_ICON = {"good": "🟢", "warning": "🟡", "serious": "🟠", "critical": "🔴", "neutral": "⚪"}
+
+
+def _zone_of(v, zones):
+    return next((z for z in zones if v < z[0]), zones[-1])
+
+
+def gauge_html(title, what, value, vfmt, zones, lo, hi, note="", ghost=None):
+    """온도계 막대: 구간(색 + 글자) 위에 현재값 핀, 예상값은 점선 핀.
+    zones = [(상한, 상태키, 쉬운 말), ...] 오름차순. 색만으로 구분하지 않도록 글자를 같이 씀."""
+    c = theme()
+    pos = lambda v: max(0.0, min(100.0, (v - lo) / (hi - lo) * 100))
+    cur = _zone_of(value, zones)
+    segs, ticks, prev = "", "", lo
+    for ub, key, lab in zones:
+        u = min(ub, hi)
+        on = (ub, key, lab) == cur
+        segs += (f'<div style="width:{pos(u) - pos(prev):.2f}%;background:rgba({ZONE_RGB[key]},'
+                 f'{.42 if on else .16});display:flex;align-items:center;justify-content:center;'
+                 f'font-size:11px;{"font-weight:700;" if on else ""}color:{c["text"] if on else c["text2"]};'
+                 f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 2px">{lab}</div>')
+        if u < hi:
+            ticks += (f'<span style="position:absolute;left:{pos(u):.2f}%;transform:translateX(-50%);'
+                      f'font-size:10px;color:{c["muted"]}">{vfmt.format(u).rstrip("%p").rstrip("%")}</span>')
+        prev = u
+    pin = (f'<div style="position:absolute;left:{pos(value):.2f}%;top:-5px;bottom:-5px;width:3px;'
+           f'margin-left:-1.5px;background:{c["text"]};border-radius:2px"></div>')
+    if ghost is not None:
+        pin += (f'<div title="예상" style="position:absolute;left:{pos(ghost):.2f}%;top:-5px;bottom:-5px;'
+                f'border-left:2px dashed {c["text2"]};margin-left:-1px"></div>')
+    return (
+        f'<div style="border:1px solid {c["border"]};border-radius:10px;padding:10px 14px 8px;'
+        f'background:rgba(127,127,127,.04)">'
+        f'<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
+        f'<div><div style="font-weight:700;font-size:.95rem">{title}</div>'
+        f'<div style="font-size:.75rem;color:{c["muted"]}">{what}</div></div>'
+        f'<div style="text-align:right;white-space:nowrap"><span style="font-size:1.55rem;font-weight:800">'
+        f'{vfmt.format(value)}</span><br><span style="font-size:.85rem;font-weight:600">'
+        f'{ZONE_ICON[cur[1]]} {cur[2]}</span></div></div>'
+        f'<div style="position:relative;margin:8px 0 2px"><div style="display:flex;height:24px;'
+        f'border-radius:6px;overflow:hidden">{segs}</div>{pin}</div>'
+        f'<div style="position:relative;height:14px">{ticks}</div>'
+        f'<div style="font-size:.8rem;color:{c["text2"]};margin-top:2px">{note}</div></div>')
+
+
+def takeaway(lines, title="📌 한 줄 요약"):
+    """탭 맨 위 큰 결론 박스. lines = [문장, ...] (마크다운 굵게 ** 대신 <b> 사용)"""
+    c = theme()
+    body = "".join(f'<div style="margin:.15rem 0">{s}</div>' for s in lines)
+    st.markdown(
+        f'<div style="border-left:6px solid {c["series"][0]};background:rgba(42,120,214,.07);'
+        f'border-radius:8px;padding:12px 16px;margin:4px 0 14px;font-size:1.08rem;line-height:1.55">'
+        f'<div style="font-size:.85rem;font-weight:700;color:{c["text2"]};margin-bottom:4px">{title}</div>'
+        f'{body}</div>', unsafe_allow_html=True)
 
 
 def stage_badge(key, title="현재 신호 단계", size="2rem"):
@@ -602,23 +663,132 @@ if btn.button("🔄 데이터 갱신", width="stretch"):
     st.cache_data.clear()
     st.rerun()
 
-h1, h2, h3 = st.columns([1.2, 1.2, 2])
-with h1:
+# ================================================================
+# 한눈에 보기 — 초보도 바로: ① 지금 상태 ② 왜 ③ 뭐가 바뀌면 달라지나
+# ================================================================
+cpi_m = f"{cpi_yoy.index[-1]:%Y.%m}" if hasattr(cpi_yoy.index[-1], "strftime") else "수동"
+ps = mr.plain_summary(ind, th, stage, regime)
+S, C = mr.STAGES[stage], theme()
+
+# ① 큰 결론 카드: 단계 + 한 줄 결론 + 단계 사다리 + 이유 + 할 일
+ladder = mr.LADDER if regime == "HIGH" else ["RED", "YELLOW", "GREEN", "GOLD"]
+chips = "".join(
+    f'<span style="display:inline-block;padding:3px 9px;margin:2px 3px 2px 0;border-radius:999px;'
+    f'font-size:.8rem;border:2px solid {mr.STAGES[k]["color"] if k == stage else C["border"]};'
+    f'{"font-weight:800;" if k == stage else "opacity:.5;"}">'
+    f'{mr.STAGES[k]["icon"]} {mr.STAGES[k]["label"]}</span>'
+    for k in ladder)
+why = "".join(f"<li>{r}</li>" for r in ps["reasons"])
+hero_l, hero_r = st.columns([1.05, 1.6], gap="medium")
+with hero_l:
     st.markdown(
-        f'<div style="padding:.55rem 1rem;border-radius:6px;background:rgba(127,127,127,.08)">'
-        f'<div style="font-size:.85rem;opacity:.7">현재 레짐</div>'
-        f'<div style="font-size:2rem;font-weight:700;line-height:1.25">'
-        f'{"🔥 고물가 시대" if regime == "HIGH" else "🧊 저물가 시대"}</div></div>',
-        unsafe_allow_html=True)
-with h2:
-    stage_badge(stage)
-with h3:
-    cpi_m = f"{cpi_yoy.index[-1]:%Y.%m}" if hasattr(cpi_yoy.index[-1], "strftime") else "수동"
-    st.markdown(
-        f"**데이터 기준** · CPI {cpi_m} ({msrc}) · 10년물 {y10:.2f}% ({y10_src})  \n"
-        f"{regime_why}  \n"
-        f"<span style='opacity:.7'>시세 받은 시각 {fetched_at():%m/%d %H:%M} · 1시간마다 갱신 · "
-        f"투자 권유 아님</span>", unsafe_allow_html=True)
+        f'<div style="border:1px solid {C["border"]};border-left:10px solid {S["color"]};'
+        f'border-radius:12px;padding:14px 18px">'
+        f'<div style="font-size:.85rem;color:{C["text2"]}">지금은 · '
+        f'{"🔥 고물가 시대" if regime == "HIGH" else "🧊 저물가 시대"} 규칙 적용</div>'
+        f'<div style="font-size:2.6rem;font-weight:800;line-height:1.15;margin-top:2px">'
+        f'{S["icon"]} {S["label"]}</div>'
+        f'<div style="font-size:1.3rem;font-weight:700;margin:2px 0 8px">→ {ps["headline"]}</div>'
+        f'<div style="margin-bottom:8px">{chips}</div>'
+        f'<ul style="margin:0 0 10px 1.1rem;padding:0;font-size:.92rem;line-height:1.5">{why}</ul>'
+        f'<div style="background:rgba(127,127,127,.08);border-radius:8px;padding:8px 12px;'
+        f'font-size:.92rem;line-height:1.55"><b>할 일</b><br>'
+        f'레버리지: <b>{ps["lev"]}</b><br>현금: <b>{ps["cash"]}</b><br>'
+        f'<span style="color:{C["text2"]}">몸통 적립 · 커버드콜: 지표와 상관없이 그대로</span>'
+        f'</div></div>', unsafe_allow_html=True)
+
+# ② 왜? — 지표별 온도계
+with hero_r:
+    up_n, dn_n = mr.rising_streak(ind["cpi"]), mr.falling_streak(ind["cpi"])
+    trend = f"{up_n}개월 연속 상승" if up_n else f"{dn_n}개월 연속 하락" if dn_n else "지난달과 같음"
+    cpi_zones = [(th["gold_cpi"], "good", "안정"), (th["cpi_red"], "warning", "높음"),
+                 (99, "critical", "위험")]
+    nz = (f" · 다음 예상 <b>{nowcast:.2f}%</b> ({ZONE_ICON[_zone_of(nowcast, cpi_zones)[1]]} "
+          f"{_zone_of(nowcast, cpi_zones)[2]})" if nowcast is not None else "")
+    g = [gauge_html("물가", "CPI 전년비 · 오르면 금리도 못 내려 주식에 불리",
+                    ind["cpi"][-1], "{:.1f}%", cpi_zones, 1.0, 6.0,
+                    note=f"최근: {trend}{nz} <span style='opacity:.7'>(점선 = 예상)</span>",
+                    ghost=nowcast)]
+    hi_ = th["y10_high"]
+    g.append(gauge_html(
+        "금리", "미국 10년물 · 자산시장의 중력, 높을수록 주식·반도체가 무거움",
+        y10, "{:.2f}%",
+        [(th["y10_strong"], "good", "숨통"), (th["y10_green"], "warning", "보통"),
+         (hi_, "serious", "부담"), (99, "critical", "신고가")], 4.0, max(5.8, hi_ + 0.3),
+        note=(f"직전 고점 {hi_:.2f}%를 넘음" if y10 >= hi_ else
+              f"직전 고점 {hi_:.2f}%까지 <b>{hi_ - y10:.2f}%p</b>")))
+    u = ind["unrate"]
+    if len(u) >= 4:
+        du, aux = round(u[-1] - u[-4], 2), th["unrate_aux"]
+        g.append(gauge_html(
+            "고용", "실업률 3개월 변화 · " + ("고물가 시대엔 일자리가 식어야 물가가 잡힘"
+                                         if regime == "HIGH" else "저물가 시대엔 실업률이 핵심"),
+            du, "{:+.1f}%p",
+            ([(-aux, "serious", "과열→물가↑"), (aux, "neutral", "중립"), (99, "good", "식는 중→물가↓")]
+             if regime == "HIGH" else
+             [(-aux, "good", "개선"), (aux, "neutral", "중립"), (99, "critical", "악화")]),
+            -0.6, 0.6, note=f"실업률 {u[-1]:.1f}% (3개월 전 {u[-4]:.1f}%)"))
+    if fwd_per:
+        ey = 100 / fwd_per
+        g.append(gauge_html(
+            "주식 vs 채권", "주식 이익수익률(1/PER) − 10년물 · 마이너스면 국채가 더 매력",
+            ey - y10, "{:+.2f}%p",
+            [(-0.5, "serious", "채권 우위"), (0.5, "warning", "비슷"), (99, "good", "주식 우위")],
+            -3.0, 3.0, note=f"주식 {ey:.2f}% vs 국채 {y10:.2f}% (PER {fwd_per:.1f})"))
+    st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));'
+                f'gap:10px">{"".join(g)}</div>', unsafe_allow_html=True)
+
+# ③ 뭐가 바뀌면 달라지나 — 다음 CPI 결과별 + 단계별 조건
+outs = mr.next_cpi_outcomes(ind, th)
+nc_r = round(nowcast, 1) if nowcast is not None else None
+
+
+def _in_range(txt, v):
+    nums = [float(x) for x in re.findall(r"\d+\.\d", txt)]
+    return ((("이하" in txt) and v <= nums[0]) or (("이상" in txt) and v >= nums[0]) or
+            ("~" in txt and nums[0] <= v <= nums[1]) or (len(nums) == 1 and "이" not in txt
+                                                        and v == nums[0]))
+
+
+cards = ""
+for txt, k in outs:
+    s2 = mr.STAGES[k]
+    mark = (f'<div style="font-size:.78rem;margin-top:2px">← 예상 {nowcast:.2f}%</div>'
+            if nc_r is not None and _in_range(txt, nc_r) else "")
+    cards += (f'<div style="flex:1;min-width:150px;border:1px solid {C["border"]};'
+              f'border-top:5px solid {s2["color"]};border-radius:8px;padding:8px 12px">'
+              f'<div style="font-size:1.05rem;font-weight:800">CPI {txt}</div>'
+              f'<div style="font-size:1rem">→ {s2["icon"]} {s2["label"]}'
+              f'{" (유지)" if k == stage else ""}</div>{mark}</div>')
+when = f" ({ev_cpi:%m/%d})" if ev_cpi else ""
+st.markdown(
+    f'<div style="margin-top:14px;font-weight:700">다음 CPI 발표{when} 결과에 따라</div>'
+    f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">{cards}</div>',
+    unsafe_allow_html=True)
+
+trig = ""
+for t in mr.stage_triggers(ind, th, regime):
+    if t["stage"] == stage:
+        continue
+    s2 = mr.STAGES[t["stage"]]
+    rows = ""
+    for cond, met, now in t["conds"]:
+        now_html = f'<span style="color:{C["muted"]}"> · {now}</span>' if now else ""
+        rows += f'<div style="margin:2px 0">{"✅" if met else "⬜"} {cond}{now_html}</div>'
+    rule = {"그리고": "모두 충족 시", "또는": "하나만 충족해도"}.get(t["logic"], "충족 시")
+    trig += (f'<div style="border:1px solid {C["border"]};border-top:4px solid {s2["color"]};'
+             f'border-radius:8px;padding:8px 12px;font-size:.85rem">'
+             f'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+             f'<span style="font-weight:800;font-size:1rem">→ {s2["icon"]} {s2["label"]}</span>'
+             f'<span style="color:{C["muted"]};font-size:.78rem">{rule}</span></div>{rows}</div>')
+st.markdown(
+    f'<div style="margin-top:14px;font-weight:700">단계가 바뀌는 조건 — ✅ 충족 · ⬜ 아직</div>'
+    f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;'
+    f'margin-top:6px">{trig}</div>', unsafe_allow_html=True)
+
+st.caption(f"데이터 기준 · CPI {cpi_m} ({msrc}) · 10년물 {y10:.2f}% ({y10_src}) · {regime_why} · "
+           f"시세 받은 시각 {fetched_at():%m/%d %H:%M} · 1시간마다 갱신 · 투자 권유 아님")
+st.markdown("#### 시장 시세")
 
 # 시세 타일
 cols = st.columns(4) + st.columns(4)   # 4개씩 두 줄 (8개 한 줄은 숫자가 잘림)
@@ -638,19 +808,12 @@ cols[5].metric(f"실업률{um}", f"{unrate.iloc[-1]:.1f}%",
                f"{unrate.iloc[-1] - unrate.iloc[-2]:+.1f}%p", delta_color="off", border=True)
 
 (t_signal, t_lag, t_surp, t_rate, t_infl, t_semi, t_oil, t_tri, t_help) = st.tabs(
-    ["🧭 신호 판정", "📊 시차 분석", "🎯 CPI 서프라이즈", "국채 금리", "물가·고용", "반도체",
+    ["🧭 판정 근거", "📊 시차 분석", "🎯 CPI 서프라이즈", "국채 금리", "물가·고용", "반도체",
      "WTI 유가", "나스닥 트라이팟", "도움말"])
 
 # ---------------------------------------------------------------- 신호 판정
 with t_signal:
-    # ② 현재 액션 카드 (스펙 6-3)
-    st.subheader(f"지금 할 일 — {mr.STAGES[stage]['icon']} {mr.STAGES[stage]['label']}")
-    act = mr.ACTIONS[stage]
-    for col, lab, txt in zip(st.columns(4), ["몸통 적립", "커버드콜", "레버리지 (꼬리 10%)",
-                                             "대기 현금"], act):
-        with col.container(border=True):
-            st.caption(lab)
-            st.markdown(f"**{txt}**")
+    # ② 지금 할 일은 맨 위 '한눈에 보기'에. 여기선 판정 근거를 자세히
     st.caption("몸통은 지표와 무관하게 매달 적립. 신호 규칙은 레버리지와 대기 현금에만 적용 · "
                "하락 베팅(인버스·공매도)은 하지 않음")
 
@@ -800,6 +963,7 @@ with t_lag:
         cur = history.latest_peak(x, 12, kw["min_drop"] * 0.5)
         if cur in peaks:
             cur = None
+        box = st.empty()     # 📌 한 줄 요약 자리 (아래에서 계산 후 채움)
 
         # 위: 지표 + 정점 / 아래: 자산 (같은 기간, 정점 세로선)
         cth = theme()
@@ -848,28 +1012,58 @@ with t_lag:
         # 요약은 확정된(24개월 지난) 정점만
         done = (tbl[(tbl["비고"] == "") & tbl["바닥까지 (개월)"].notna()]
                 if "바닥까지 (개월)" in tbl else tbl.iloc[0:0])
+        an = LONG_ASSETS[asset]
+
+        st.markdown(f"**시차별 상관계수** — {ind_name}의 6개월 변화와, 그 L개월 뒤부터 3개월간 "
+                    f"{an} 수익률의 관계")
+        corr = history.lag_corr(x.diff(6), pa, lags=range(-12, 25), fwd=3)
+        after, before = corr[corr.index >= 0], corr[corr.index < 0]
+        L_min, c_min = int(after.idxmin()), after.min()
+        L_lead = int(before.abs().idxmax())
+        fig = bar_chart(corr, xlab="지표가 변한 시점(0) 기준 개월 수",
+                        ylab="상관계수 (− = 주가 약세)", hover_x="L = ")
+        fig.add_vline(x=0, line=dict(color=cth["text2"], width=1, dash="dot"))
+        ymax = float(corr.abs().max()) * 1.25
+        fig.update_yaxes(range=[-ymax, ymax])
+        for xx, txt, anc in ((-0.6, "← 주가가 지표보다 먼저 움직인 구간", "right"),
+                             (0.6, "지표가 변한 뒤 주가 반응 →", "left")):
+            fig.add_annotation(x=xx, y=ymax * 0.97, text=txt, showarrow=False, xanchor=anc,
+                               font=dict(size=11, color=cth["text2"]))
+        fig.add_annotation(x=L_min, y=c_min, text=f"가장 약함: {L_min}개월 뒤", showarrow=True,
+                           arrowhead=0, ay=28, font=dict(size=11, color=cth["text"]))
+        show(fig)
+        st.caption("막대가 아래로 길수록 '지표가 오르면 그만큼 뒤에 주가가 약했다'는 뜻. "
+                   "±0.2 안쪽은 약한 관계이고, 겹치는 구간으로 계산해서 실제보다 강해 보일 수 있음 · "
+                   f"CPI 출처 {hsrc}")
+
+        # 📌 한 줄 요약 (맨 위 자리에 채움)
+        strength = lambda v: ("거의 없음" if abs(v) < 0.1 else "약함" if abs(v) < 0.2
+                              else "보통" if abs(v) < 0.35 else "강함")
+        lines = []
         if len(done):
             fell = done[done["정점 대비 최저"] < -10]
-            st.info(
-                f"확정된 정점 {len(done)}번 기준 · 주가 고점은 정점 대비 중간값 "
-                f"**{done['주가 고점 (정점 대비)'].median():+.0f}개월** "
-                f"(음수 = 주가가 먼저 꺾임) · 정점 후 24개월 내 바닥까지 중간값 "
-                f"**{done['바닥까지 (개월)'].median():.0f}개월** · "
-                f"10% 넘게 빠진 경우 **{len(fell)}번** "
-                f"({', '.join(fell['지표 정점']) or '없음'}) · 12개월 뒤 수익률 중간값 "
-                f"**{done['12개월 뒤'].median():+.1f}%**")
-
-        st.markdown(f"**시차별 상관계수** — {ind_name} 6개월 변화 vs L개월 뒤부터 3개월간 "
-                    f"{LONG_ASSETS[asset]} 수익률")
-        corr = history.lag_corr(x.diff(6), pa, lags=range(-12, 25), fwd=3)
-        show(bar_chart(corr, xlab="L (개월) · 음수 = 주가가 지표보다 먼저 움직임",
-                       hover_x="L = "))
-        after, before = corr[corr.index >= 0], corr[corr.index < 0]
-        st.caption(
-            f"지표가 오른 뒤 주가가 가장 약했던 시점: **{after.idxmin()}개월 뒤** "
-            f"(상관 {after.min():+.2f}) · 주가 선행이 가장 강한 시점: **{-before.abs().idxmax()}개월 전** "
-            f"(상관 {before[before.abs().idxmax()]:+.2f}) · ±0.2 안쪽은 약한 관계이고, "
-            f"겹치는 구간으로 계산해서 실제보다 강해 보일 수 있음 · CPI 출처 {hsrc}")
+            n, k = len(done), len(fell)
+            yrs = ", ".join(s[:4] for s in fell["지표 정점"])
+            lines.append(f"{an} 기준, 과거 <b>{n}번</b>의 {ind_name} 정점 뒤 2년 안에 10% 넘게 빠진 건 "
+                         f"<b>{k}번</b>" + (f" ({yrs})" if k else "") + "이었습니다.")
+            m = done["주가 고점 (정점 대비)"].median()
+            if m <= -2:
+                lines.append(f"주가 고점은 보통 지표 정점보다 <b>{-m:.0f}개월 먼저</b> 왔습니다 "
+                             "→ 주가가 지표보다 앞서 움직입니다.")
+            elif m >= 9:
+                lines.append("정점 뒤에도 주가가 1년 가까이 더 오른 경우가 많았습니다 "
+                             "→ 지표 정점이 곧 주가 고점은 아닙니다.")
+            else:
+                lines.append(f"주가 고점은 지표 정점 무렵(중간값 {m:+.0f}개월)에 왔습니다.")
+        lines.append(f"{ind_name}가 오르면 {an} 주가는 <b>약 {L_min}개월 뒤</b>에 가장 약했습니다 "
+                     f"(관계 {strength(c_min)}).")
+        if cur is not None and cur in pa.index:
+            lines.append(f"지금: {ind_name} 잠정 정점 {cur} ({x[cur]:.1f}%) 이후 "
+                         f"{(pa.index[-1] - cur).n}개월, {an} <b>{(pa.iloc[-1] / pa[cur] - 1) * 100:+.1f}%</b>.")
+        if len(done) and len(fell) <= len(done) / 2:
+            lines.append("<b>→ 지표가 튄다고 바로 무너지진 않았습니다. 크게 빠진 건 다른 재료가 겹친 때였습니다.</b>")
+        with box.container():
+            takeaway(lines)
 
 # ---------------------------------------------------------------- CPI 서프라이즈
 with t_surp:
@@ -885,6 +1079,7 @@ with t_surp:
 
         st.markdown("CPI 발표 때마다 **발표 직전 예상치**(클리블랜드 연준 나우캐스트)와 **실제치**의 차이, "
                     "그리고 그날 시장 반응입니다. 시장은 숫자 자체보다 **예상과의 차이**에 반응합니다.")
+        sbox = st.empty()     # 📌 한 줄 요약 자리
         last = sp.iloc[-1]
         m = st.columns(4)
         m[0].metric(f"다음 발표 {ev_cpi:%m/%d}" if ev_cpi else "다음 발표",
@@ -912,6 +1107,22 @@ with t_surp:
         grp = sp.groupby("구분", observed=False).agg(
             횟수=("surprise", "size"), **{n: (t, "mean") for t, n in LONG_ASSETS.items()},
             **{"10년물 (bp)": ("10년물", "mean")}).reset_index()
+        g3 = grp.set_index("구분")
+        lo_r, hi_r = g3.iloc[0], g3.iloc[2]
+        sl = [f"CPI가 예상보다 <b>0.1%p 이상 높게</b> 나온 날 → 반도체 평균 "
+              f"<b>{hi_r['반도체(SOX)']:+.2f}%</b>, 10년물 {hi_r['10년물 (bp)']:+.1f}bp "
+              f"({int(hi_r['횟수'])}번)",
+              f"CPI가 예상보다 <b>0.1%p 이상 낮게</b> 나온 날 → 반도체 평균 "
+              f"<b>{lo_r['반도체(SOX)']:+.2f}%</b>, 10년물 {lo_r['10년물 (bp)']:+.1f}bp "
+              f"({int(lo_r['횟수'])}번)"]
+        if nowcast is not None:
+            sl.append(f"다음 발표{f' {ev_cpi:%m/%d}' if ev_cpi else ''}: 예상 <b>{nowcast:.2f}%</b> "
+                      "→ 이보다 높으면 약세, 낮으면 강세 쪽이 과거 패턴입니다.")
+        sl.append("<b>→ 시장은 숫자 자체가 아니라 '예상과의 차이'에 반응합니다.</b>"
+                  + (" 고물가 시대(2021~)엔 이 반응이 더 커졌습니다." if not per.startswith("고물가") else ""))
+        with sbox.container():
+            takeaway(sl, title=f"📌 한 줄 요약 — {per}")
+
         st.markdown("**서프라이즈 방향별 발표 당일 평균 반응**")
         pct = st.column_config.NumberColumn(format="%+.2f%%")
         st.dataframe(grp, hide_index=True, width="stretch", column_config={
@@ -938,9 +1149,10 @@ with t_surp:
                       color=cth["text2"], size=12),
             hoverlabel=dict(bgcolor=cth["surface"], font_color=cth["text"]),
             xaxis=dict(title="서프라이즈 (실제 − 예상, %p)", showgrid=False, zeroline=False,
-                       linecolor=cth["axis"], tickfont=dict(color=cth["muted"])),
+                       linecolor=cth["axis"], tickfont=dict(color=cth["muted"]), automargin=True),
             yaxis=dict(title=f"{LONG_ASSETS[pick]} 발표 당일 (%)", gridcolor=cth["grid"],
-                       zeroline=False, tickfont=dict(color=cth["muted"]), ticksuffix="%"))
+                       zeroline=False, tickfont=dict(color=cth["muted"]), ticksuffix="%",
+                       automargin=True))
         st.markdown(f"**서프라이즈 vs {LONG_ASSETS[pick]} 당일 수익률** (점 하나 = 발표 한 번)")
         show(fig)
         st.caption(f"상관계수 {d.surprise.corr(d[pick]):+.2f} · 오른쪽 아래(예상보다 높고 주가 하락)에 "

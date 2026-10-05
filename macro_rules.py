@@ -217,3 +217,135 @@ def leverage_check(price, entry, th):
         return ret, "TAKE", f"익절 구간(+{th['take_profit']:.0f}% 이상) 도달"
     return ret, None, (f"손절선까지 {ret - th['stop_loss']:.1f}%p · "
                        f"익절까지 {th['take_profit'] - ret:.1f}%p")
+
+
+# ================================================================
+# 초보용 쉬운 말 해석 (화면 맨 위 '한눈에 보기')
+# ================================================================
+LADDER = ["RED", "ORANGE", "YELLOW", "GREEN", "GREEN2"]   # 나쁨 -> 좋음 순서
+
+PLAIN = {   # 단계 -> (한 줄 결론, 레버리지, 현금)
+    "RED":    ("피해야 할 구간", "레버리지 전부 정리", "현금 늘리기, 비싼 성장주·반도체 일부 축소"),
+    "ORANGE": ("줄여야 할 구간", "레버리지 절반으로, 다시 사지 않기", "현금 유지·확대"),
+    "YELLOW": ("기다리는 구간", "레버리지 새로 사지 않기 (보유분은 익절/손절 규칙대로)",
+               "현금은 단기채로 이자 받으며 대기"),
+    "GREEN":  ("나눠 사기 시작하는 구간", "스윙 다시 시작",
+               "대기 현금 1/3을 지수 ETF에 3개월 나눠 투입"),
+    "GREEN2": ("적극적으로 사는 구간", "스윙 적극", "남은 대기 현금 전부 투입"),
+    "GOLD":   ("강한 상승장 구간", "스윙 적극", "남은 대기 현금 전부 투입"),
+}
+
+
+def cpi_zone(v, th):
+    """물가 수준 구간: (키, 쉬운 말)"""
+    if v < th["gold_cpi"]:
+        return "good", "안정"
+    if v < th["cpi_red"]:
+        return "warning", "높음"
+    return "critical", "위험"
+
+
+def y10_zone(v, th):
+    if v < th["y10_strong"]:
+        return "good", "숨통 트임"
+    if v < th["y10_green"]:
+        return "warning", "보통"
+    if v < th["y10_high"]:
+        return "serious", "부담"
+    return "critical", "신고가"
+
+
+def plain_summary(ind, th, stage, regime):
+    """화면 맨 위 큰 카드용. 반환: dict(headline, reasons[...], lev, cash)"""
+    cpi, y10, hi = ind["cpi"][-1], ind["y10"], ind["y10_high"]
+    up, down = rising_streak(ind["cpi"]), falling_streak(ind["cpi"])
+    nowcast = ind.get("nowcast")
+    peak12 = max(ind["cpi"][-12:])
+
+    trend = ("다시 오르는 중" if up >= 1 else "내려오는 중" if down >= 1 else "제자리")
+    if nowcast is not None and up == 0 and nowcast >= cpi + 0.15:
+        trend += ", 다음엔 오를 조짐"
+    elif nowcast is not None and down == 0 and nowcast <= cpi - 0.15:
+        trend += ", 다음엔 내릴 조짐"
+    r_cpi = f"물가 {cpi:.1f}% — {cpi_zone(cpi, th)[1]}, {trend}"
+    if peak12 >= cpi + 0.5:
+        r_cpi += f" (1년 내 정점 {peak12:.1f}%에서 내려옴)"
+
+    _, yz = y10_zone(y10, th)
+    if y10 >= hi:
+        r_y10 = f"금리 {y10:.2f}% — 직전 고점 {hi:.2f}%를 뚫음 (자산시장에 가장 큰 부담)"
+    elif hi - y10 <= 0.15:
+        r_y10 = f"금리 {y10:.2f}% — {yz}, 고점 {hi:.2f}%까지 {hi - y10:.2f}%p 남음"
+    else:
+        r_y10 = f"금리 {y10:.2f}% — {yz}"
+
+    reasons = [r_cpi, r_y10]
+    if regime == "LOW":
+        u = ind["unrate"]
+        reasons.append(f"실업률 {u[-1]:.1f}% — 저물가 시대엔 실업률이 핵심 "
+                       f"({'오르는 중' if u[-1] > u[-2] else '내려오는 중' if u[-1] < u[-2] else '제자리'})")
+    head, lev, cash = PLAIN[stage]
+    return dict(headline=head, reasons=reasons, lev=lev, cash=cash)
+
+
+def next_cpi_outcomes(ind, th, lo=2.5, hi=4.5):
+    """다음 CPI가 x%로 나오면 단계가 뭐가 되나 -> 같은 단계끼리 묶은 구간 목록.
+    반환: [(구간 문구, 단계키), ...]  예) [('3.4% 이하', 'YELLOW'), ('3.5% 이상', 'ORANGE')]"""
+    vals = [round(lo + i / 10, 1) for i in range(int(round((hi - lo) * 10)) + 1)]
+    groups = []
+    for v in vals:
+        k, _ = scenario(ind, th, v)
+        if groups and groups[-1][2] == k:
+            groups[-1][1] = v
+        else:
+            groups.append([v, v, k])
+    out = []
+    for i, (a, b, k) in enumerate(groups):
+        if len(groups) == 1:
+            txt = "어떤 값이 나와도"
+        elif i == 0:
+            txt = f"{b:.1f}% 이하"
+        elif i == len(groups) - 1:
+            txt = f"{a:.1f}% 이상"
+        else:
+            txt = f"{a:.1f}%" if a == b else f"{a:.1f} ~ {b:.1f}%"
+        out.append((txt, k))
+    return out
+
+
+def stage_triggers(ind, th, regime):
+    """현재 말고 다른 단계로 가려면 무엇이 필요한가.
+    반환: [dict(stage, logic('그리고'/'또는'), conds=[(조건, 충족여부, 지금 상태)]), ...]"""
+    cpi, y10, hi = ind["cpi"][-1], ind["y10"], ind["y10_high"]
+    up, down, n = rising_streak(ind["cpi"]), falling_streak(ind["cpi"]), th["streak"]
+    if regime == "HIGH":
+        return [
+            dict(stage="RED", logic="그리고", conds=[
+                (f"물가 {th['cpi_red']:.1f}% 이상", cpi >= th["cpi_red"], f"지금 {cpi:.1f}%"),
+                (f"금리가 고점 {hi:.2f}% 돌파", y10 >= hi,
+                 f"지금 {y10:.2f}%" + ("" if y10 >= hi else f" ({hi - y10:.2f}%p 남음)"))]),
+            dict(stage="ORANGE", logic="또는", conds=[
+                (f"물가 {th['cpi_red']:.1f}% 이상", cpi >= th["cpi_red"], f"지금 {cpi:.1f}%"),
+                (f"물가 {n}개월 연속 상승", up >= n, f"지금 {up}개월째")]),
+            dict(stage="GREEN", logic="그리고", conds=[
+                (f"물가 {n}개월 연속 하락", down >= n, f"지금 {down}개월째"),
+                (f"금리 {th['y10_green']:.1f}% 아래", y10 < th["y10_green"],
+                 f"지금 {y10:.2f}%" + ("" if y10 < th["y10_green"]
+                                      else f" ({y10 - th['y10_green']:.2f}%p 내려와야)"))]),
+            dict(stage="GREEN2", logic="그리고", conds=[
+                ("🟢 조건 충족", down >= n and y10 < th["y10_green"], ""),
+                (f"금리 {th['y10_strong']:.1f}% 아래", y10 < th["y10_strong"], f"지금 {y10:.2f}%"),
+                ("연준 금리 인상 중단", bool(ind.get("fed_pause")), "")]),
+        ]
+    u = ind["unrate"]
+    low12, udown = min(u[-12:]), falling_streak(u)
+    return [
+        dict(stage="RED", logic="", conds=[
+            (f"실업률이 1년 최저({low12:.1f}%)보다 {th['unrate_rise']:.1f}%p 이상 상승",
+             u[-1] - low12 >= th["unrate_rise"], f"지금 {u[-1]:.1f}%")]),
+        dict(stage="GREEN", logic="", conds=[
+            (f"실업률 {n}개월 연속 하락", udown >= n, f"지금 {udown}개월째")]),
+        dict(stage="GOLD", logic="그리고", conds=[
+            (f"실업률 {n}개월 연속 하락", udown >= n, f"지금 {udown}개월째"),
+            (f"물가 {th['gold_cpi']:.1f}% 이하", cpi <= th["gold_cpi"], f"지금 {cpi:.1f}%")]),
+    ]
