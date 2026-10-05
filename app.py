@@ -259,7 +259,7 @@ def yf_daily():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_intraday():
-    df = _close(yf.download(list(RT_YIELDS) + [WTI, SOX], period="5d", interval="5m",
+    df = _close(yf.download(list(RT_YIELDS) + [WTI, SOX, "RB=F"], period="5d", interval="5m",
                             progress=False, auto_adjust=False))
     idx = pd.to_datetime(df.index)
     df.index = (idx.tz_localize("UTC") if idx.tz is None else idx).tz_convert(KST)
@@ -877,18 +877,28 @@ with st.expander(line, expanded=False):
                  f'<div style="font-size:.75rem;color:{C["muted"]}">{path[0][0]} {vs[0]:.2f}% → '
                  f'{path[-1][0]} {vs[-1]:.2f}%</div>')
 
-    # 에너지: 대상월 평균 vs 전월 평균
+    # 에너지: 지금 가격 + 대상월 평균 (CPI엔 그 달 '평균' 가격이 반영되므로 전월 평균과 비교)
     en = safe(energy_daily, "휘발유·유가", quiet=True)
+    iq = safe(yf_intraday, "장중 시세", quiet=True)
+    ongoing = " (진행 중)" if p_target == pd.Period(today, "M") else ""
     en_rows = ""
     if en is not None:
         mon = en.index.to_period("M")
-        for tkr, lab in (("RB=F", "휘발유"), (WTI, "WTI")):
+        for tkr, lab, unit in (("RB=F", "휘발유", "갤런"), (WTI, "WTI", "배럴")):
             a = en.loc[mon == p_target, tkr].mean()
             b = en.loc[mon == p_target - 1, tkr].mean()
-            if pd.notna(a) and pd.notna(b):
-                en_rows += (f'<div style="font-size:1rem;font-weight:700">{lab} '
-                            f'{(a / b - 1) * 100:+.1f}%</div>')
-    ongoing = " (진행 중)" if p_target == pd.Period(today, "M") else ""
+            if iq is not None and tkr in iq and iq[tkr].notna().any():
+                s_ = iq[tkr].dropna()
+                live = f'지금 <b>${s_.iloc[-1]:,.2f}</b> <span style="color:{C["muted"]}">'                        f'({s_.index[-1]:%m/%d %H:%M})</span>'
+            else:
+                d_ = en[tkr].dropna()
+                live = f'지금 <b>${d_.iloc[-1]:,.2f}</b> <span style="color:{C["muted"]}">'                        f'({d_.index[-1]:%m/%d} 종가)</span>'
+            avg = (f'{p_target.month}월 평균 ${a:,.2f}{ongoing} → {(p_target - 1).month}월 대비 '
+                   f'<b>{(a / b - 1) * 100:+.1f}%</b>' if pd.notna(a) and pd.notna(b) else "월평균 자료 없음")
+            en_rows += (f'<div style="margin-top:4px"><div style="font-weight:700">{lab} '
+                        f'<span style="font-weight:400;color:{C["muted"]};font-size:.75rem">$/{unit}</span>'
+                        f'</div><div style="font-size:.85rem">{live}</div>'
+                        f'<div style="font-size:.85rem">{avg}</div></div>')
 
     # 과거 발표일 반도체 반응 (2021~, 고물가 시대)
     react = ""
@@ -899,8 +909,9 @@ with st.expander(line, expanded=False):
         react = (f'<div>예상보다 높게 → 평균 <b>{hi_r:+.2f}%</b> ▼</div>'
                  f'<div>예상보다 낮게 → 평균 <b>{lo_r:+.2f}%</b> ▲</div>')
 
-    def cell(title, big, sub, extra=""):
-        return (f'<div style="background:rgba(127,127,127,.07);border-radius:8px;padding:10px 12px">'
+    def cell(title, big, sub, extra="", wide=False):
+        return (f'<div class="{"cpi-wide" if wide else ""}" '
+                f'style="background:rgba(127,127,127,.07);border-radius:8px;padding:10px 12px">'
                 f'<div style="font-size:.78rem;color:{C["text2"]}">{title}</div>'
                 f'<div style="font-size:1.45rem;font-weight:800;line-height:1.3">{big}</div>{extra}'
                 f'<div style="font-size:.75rem;color:{C["muted"]}">{sub}</div></div>')
@@ -909,8 +920,9 @@ with st.expander(line, expanded=False):
         cell("직전 CPI", f"{prev_cpi:.1f}%", f"{(p_target - 1).month}월분")
         + cell("클리블랜드 예상", f"{fc:.2f}%" if fc is not None else "없음",
                "발표 직전 최종치" if just_out else "매 영업일 갱신", spark)
-        + cell(f"에너지 ({p_target.month}월 평균, 전월 대비){ongoing}", "", "휘발유 = RBOB 선물",
-               en_rows or f'<div style="color:{C["muted"]}">자료 없음</div>')
+        + cell(f"에너지 · {p_target.month}월분 CPI엔 {p_target.month}월 평균 가격이 반영됨", "",
+               "휘발유 = RBOB 휘발유 선물 (주유소 가격과 방향이 거의 같음)",
+               en_rows or f'<div style="color:{C["muted"]}">자료 없음</div>', wide=True)
         + cell("실제 발표치", f"{actual:.1f}%" if actual is not None else "—",
                (f"예상 대비 {actual - fc:+.2f}%p" if actual is not None and fc is not None
                 else "발표 후 자동")))
@@ -930,6 +942,8 @@ with st.expander(line, expanded=False):
         f'font-size:.8rem;color:{C["muted"]};margin-bottom:8px"><span>{p_target.month}월분 CPI'
         + (f' · {_rel_kst(ev_cpi):%m/%d %H:%M} 발표' if ev_cpi and not just_out else "")
         + f'</span><span>레버리지 · 대기 현금 판단용 (몸통 적립과 무관)</span></div>'
+        '<style>.cpi-wide{grid-column:span 2}@media (max-width:640px){.cpi-wide{grid-column:auto}}'
+        '</style>'
         f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));'
         f'gap:8px">{cells}</div>'
         f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));'
