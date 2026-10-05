@@ -116,3 +116,31 @@ def release_reaction(daily, dates):
         i = daily.index.get_loc(d)
         out[d] = (daily.iloc[i] / daily.iloc[i - 1] - 1) * 100 if i > 0 else None
     return pd.Series(out, dtype=float)
+
+
+def latest_actual(nowcast_json, series="Actual Core PCE Inflation"):
+    """클리블랜드 연준 JSON에서 해당 실제치가 들어 있는 가장 최근 대상월과 값.
+    반환: (Period('M'), 값) 또는 None. 기본은 연준 목표 지표인 근원 PCE 전년비."""
+    best = None
+    for e in nowcast_json:
+        try:
+            y, m = map(int, e["chart"]["subcaption"].split("-"))
+        except ValueError:
+            continue
+        s = next((s for s in e["dataset"] if s["seriesname"] == series), None)
+        vals = [float(x["value"]) for x in (s or {"data": []})["data"] if x.get("value")]
+        if vals:
+            p = pd.Period(year=y, month=m, freq="M")
+            if best is None or p > best[0]:
+                best = (p, vals[-1])
+    return best
+
+
+def nowcast_path(nowcast_json, target):
+    """대상월(target='2026-9')의 일별 나우캐스트 흐름 [(MM/DD, 값), ...]"""
+    for e in nowcast_json:
+        if e["chart"]["subcaption"] == target:
+            s = next((s for s in e["dataset"] if s["seriesname"] == "CPI Inflation"), None)
+            return [(x["tooltext"].split("{br}")[1], float(x["value"]))
+                    for x in (s or {"data": []})["data"] if x.get("value")]
+    return []

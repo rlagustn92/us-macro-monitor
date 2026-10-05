@@ -173,7 +173,7 @@ def _zone_of(v, zones):
     return next((z for z in zones if v < z[0]), zones[-1])
 
 
-def gauge_html(title, what, value, vfmt, zones, lo, hi, note="", ghost=None):
+def gauge_html(title, what, value, vfmt, zones, lo, hi, note="", ghost=None, foot=""):
     """온도계 막대: 구간(색 + 글자) 위에 현재값 핀, 예상값은 점선 핀.
     zones = [(상한, 상태키, 쉬운 말), ...] 오름차순. 색만으로 구분하지 않도록 글자를 같이 씀."""
     c = theme()
@@ -208,7 +208,9 @@ def gauge_html(title, what, value, vfmt, zones, lo, hi, note="", ghost=None):
         f'<div style="position:relative;margin:8px 0 2px"><div style="display:flex;height:24px;'
         f'border-radius:6px;overflow:hidden">{segs}</div>{pin}</div>'
         f'<div style="position:relative;height:14px">{ticks}</div>'
-        f'<div style="font-size:.8rem;color:{c["text2"]};margin-top:2px">{note}</div></div>')
+        f'<div style="font-size:.8rem;color:{c["text2"]};margin-top:2px">{note}</div>'
+        + (f'<div style="font-size:.76rem;color:{c["muted"]};border-top:1px solid {c["border"]};'
+           f'margin-top:6px;padding-top:5px">{foot}</div>' if foot else "") + '</div>')
 
 
 def takeaway(lines, title="📌 한 줄 요약"):
@@ -512,6 +514,27 @@ def release_dates(key):
     return out
 
 
+def surprise_frame():
+    """CPI 발표별 나우캐스트 vs 실제 + 발표 당일 S&P500·나스닥·SOX(%)·10년물(bp) 반응."""
+    sp = history.surprises(nowcast_raw())
+    dpx = daily_px_since_2013()
+    for t in LONG_ASSETS:
+        sp[t] = history.release_reaction(dpx[t].dropna(), sp["release"]).values
+    tnx = dpx["^TNX"].dropna()
+    sp["10년물"] = [(tnx.iloc[tnx.index.get_loc(d)] - tnx.iloc[tnx.index.get_loc(d) - 1]) * 100
+                   if d in tnx.index else None for d in sp["release"]]
+    return sp
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def energy_daily():
+    """휘발유 선물(RBOB, $/갤런) · WTI 일봉 6개월. CPI 에너지 항목의 방향을 보는 용도."""
+    df = _close(yf.download(["RB=F", WTI], period="6mo", interval="1d",
+                            progress=False, auto_adjust=False))
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df[df.index.dayofweek < 5]          # 일요일 저녁 선물 행 제외
+
+
 def safe(fn, what, quiet=False):
     try:
         return fn()
@@ -708,10 +731,14 @@ with hero_r:
                  (99, "critical", "위험")]
     nz = (f" · 다음 예상 <b>{nowcast:.2f}%</b> ({ZONE_ICON[_zone_of(nowcast, cpi_zones)[1]]} "
           f"{_zone_of(nowcast, cpi_zones)[2]})" if nowcast is not None else "")
+    # 연준 목표 지표(근원 PCE)는 판정엔 안 쓰고 참고 한 줄로만
+    pce = safe(lambda: history.latest_actual(nowcast_raw()), "근원 PCE", quiet=True)
+    pce_foot = (f"참고 · 연준 기준 근원 PCE <b>{pce[1]:.1f}%</b> ({pce[0].month}월) · 목표 2%"
+                if pce else "")
     g = [gauge_html("물가", "CPI 전년비 · 오르면 금리도 못 내려 주식에 불리",
                     ind["cpi"][-1], "{:.1f}%", cpi_zones, 1.0, 6.0,
                     note=f"최근: {trend}{nz} <span style='opacity:.7'>(점선 = 예상)</span>",
-                    ghost=nowcast)]
+                    ghost=nowcast, foot=pce_foot)]
     hi_ = th["y10_high"]
     g.append(gauge_html(
         "금리", "미국 10년물 · 자산시장의 중력, 높을수록 주식·반도체가 무거움",
@@ -793,6 +820,124 @@ st.markdown(
 
 st.caption(f"데이터 기준 · CPI {cpi_m} ({msrc}) · 10년물 {y10:.2f}% ({y10_src}) · {regime_why} · "
            f"시세 받은 시각 {fetched_at():%m/%d %H:%M} · 1시간마다 갱신 · 투자 권유 아님")
+# ================================================================
+# CPI 발표 패널 — 평소엔 접힌 한 줄, 누르면 펼침
+#   발표 전: 직전 CPI / 클리블랜드 예상(이번 달 흐름) / 에너지 / 실제(발표 후)
+#   발표 후 5일간: 방금 나온 결과와 서프라이즈
+# ================================================================
+_rel_kst = lambda d: pd.Timestamp(d.year, d.month, d.day, 8, 30,
+                                  tz="America/New_York").tz_convert(KST)
+sp_all = safe(surprise_frame, "CPI 서프라이즈 기록", quiet=True)
+latest_p = pd.Period(cpi_yoy.index[-1], "M") if hasattr(cpi_yoy.index[-1], "strftime") else None
+last_rel, row_latest = (rel or {}).get("CPI_last"), None
+if sp_all is not None and latest_p is not None:
+    hit = sp_all[sp_all.target == latest_p]
+    if len(hit):
+        row_latest = hit.iloc[-1]
+        last_rel = last_rel or row_latest.release.date()
+just_out = last_rel is not None and 0 <= (today - last_rel).days <= 5
+
+if just_out:
+    p_target, prev_cpi, actual = latest_p, cpi_yoy.iloc[-2], cpi_yoy.iloc[-1]
+    fc = float(row_latest.nowcast) if row_latest is not None else None
+else:
+    p_target, prev_cpi, actual = pd.Period(target, "M"), cpi_yoy.iloc[-1], None
+    fc = nc[0] if nc else None
+
+# A안 한 줄 (접힌 상태의 제목)
+outs = mr.next_cpi_outcomes(ind, th)
+risky = " · ".join(f"{txt}이면 {mr.STAGES[k]['icon']} {mr.STAGES[k]['label']}"
+                   for txt, k in outs if k != stage)
+if just_out:
+    line = (f"📅 CPI 발표 완료 ({last_rel:%m/%d}) · {p_target.month}월분 **{actual:.1f}%**"
+            + (f" · 예상 {fc:.2f}% 대비 {actual - fc:+.2f}%p" if fc is not None else ""))
+else:
+    dn = (ev_cpi - today).days if ev_cpi else None
+    line = ("📅 CPI " + ("발표일 미정" if dn is None else "오늘 발표" if dn == 0 else f"D-{dn}")
+            + (f" · {_rel_kst(ev_cpi):%m/%d %H:%M}" if ev_cpi else "")
+            + (f" · {p_target.month}월분 · 예상 **{fc:.2f}%** (직전 {prev_cpi:.1f}%)"
+               if fc is not None else f" · {p_target.month}월분 · 클리블랜드 최신 전망 없음"))
+    if risky:
+        line += f" · {risky}"
+
+with st.expander(line, expanded=False):
+    # 클리블랜드 예상치의 이번 달 흐름 (작은 선)
+    path = history.nowcast_path(nowcast_raw(), f"{p_target.year}-{p_target.month}") \
+        if sp_all is not None else []
+    spark = ""
+    if len(path) >= 2:
+        vs = [v for _, v in path]
+        lo_, hi_ = min(vs), max(vs)
+        rng_ = (hi_ - lo_) or 1
+        pts = " ".join(f"{i / (len(vs) - 1) * 100:.1f},{20 - (v - lo_) / rng_ * 16:.1f}"
+                       for i, v in enumerate(vs))
+        spark = (f'<svg viewBox="0 0 100 22" preserveAspectRatio="none" width="100%" height="22">'
+                 f'<polyline points="{pts}" fill="none" stroke="{C["series"][0]}" stroke-width="2" '
+                 f'vector-effect="non-scaling-stroke"/></svg>'
+                 f'<div style="font-size:.75rem;color:{C["muted"]}">{path[0][0]} {vs[0]:.2f}% → '
+                 f'{path[-1][0]} {vs[-1]:.2f}%</div>')
+
+    # 에너지: 대상월 평균 vs 전월 평균
+    en = safe(energy_daily, "휘발유·유가", quiet=True)
+    en_rows = ""
+    if en is not None:
+        mon = en.index.to_period("M")
+        for tkr, lab in (("RB=F", "휘발유"), (WTI, "WTI")):
+            a = en.loc[mon == p_target, tkr].mean()
+            b = en.loc[mon == p_target - 1, tkr].mean()
+            if pd.notna(a) and pd.notna(b):
+                en_rows += (f'<div style="font-size:1rem;font-weight:700">{lab} '
+                            f'{(a / b - 1) * 100:+.1f}%</div>')
+    ongoing = " (진행 중)" if p_target == pd.Period(today, "M") else ""
+
+    # 과거 발표일 반도체 반응 (2021~, 고물가 시대)
+    react = ""
+    if sp_all is not None:
+        r21 = sp_all[sp_all.release >= "2021-01-01"]
+        hi_r = r21[r21.surprise >= 0.1]["^SOX"].mean()
+        lo_r = r21[r21.surprise <= -0.1]["^SOX"].mean()
+        react = (f'<div>예상보다 높게 → 평균 <b>{hi_r:+.2f}%</b> ▼</div>'
+                 f'<div>예상보다 낮게 → 평균 <b>{lo_r:+.2f}%</b> ▲</div>')
+
+    def cell(title, big, sub, extra=""):
+        return (f'<div style="background:rgba(127,127,127,.07);border-radius:8px;padding:10px 12px">'
+                f'<div style="font-size:.78rem;color:{C["text2"]}">{title}</div>'
+                f'<div style="font-size:1.45rem;font-weight:800;line-height:1.3">{big}</div>{extra}'
+                f'<div style="font-size:.75rem;color:{C["muted"]}">{sub}</div></div>')
+
+    cells = (
+        cell("직전 CPI", f"{prev_cpi:.1f}%", f"{(p_target - 1).month}월분")
+        + cell("클리블랜드 예상", f"{fc:.2f}%" if fc is not None else "없음",
+               "발표 직전 최종치" if just_out else "매 영업일 갱신", spark)
+        + cell(f"에너지 ({p_target.month}월 평균, 전월 대비){ongoing}", "", "휘발유 = RBOB 선물",
+               en_rows or f'<div style="color:{C["muted"]}">자료 없음</div>')
+        + cell("실제 발표치", f"{actual:.1f}%" if actual is not None else "—",
+               (f"예상 대비 {actual - fc:+.2f}%p" if actual is not None and fc is not None
+                else "발표 후 자동")))
+    if just_out:
+        res = (f'<div>결과: <b>{mr.STAGES[stage]["icon"]} {mr.STAGES[stage]["label"]}</b></div>'
+               f'<div style="color:{C["text2"]}">→ {mr.PLAIN[stage][0]}</div>')
+    else:
+        res = "".join(
+            f'<div>{txt} → <b>{mr.STAGES[k]["icon"]} {mr.STAGES[k]["label"]}</b>'
+            f'{" (유지)" if k == stage else ""}'
+            f'{" ← 예상" if fc is not None and _in_range(txt, round(fc, 1)) else ""}</div>'
+            for txt, k in outs)
+    box = (f'<div style="border:1px solid {C["border"]};border-radius:8px;padding:8px 12px;'
+           f'font-size:.9rem"><div style="font-size:.78rem;color:{C["text2"]};margin-bottom:2px">')
+    st.markdown(
+        f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;'
+        f'font-size:.8rem;color:{C["muted"]};margin-bottom:8px"><span>{p_target.month}월분 CPI'
+        + (f' · {_rel_kst(ev_cpi):%m/%d %H:%M} 발표' if ev_cpi and not just_out else "")
+        + f'</span><span>레버리지 · 대기 현금 판단용 (몸통 적립과 무관)</span></div>'
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));'
+        f'gap:8px">{cells}</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));'
+        f'gap:8px;margin-top:8px">'
+        f'{box}{"결과" if just_out else "결과에 따라 단계"}</div>{res}</div>'
+        f'{box}과거 발표일 반도체 반응 (2021~)</div>{react or "자료 없음"}</div></div>',
+        unsafe_allow_html=True)
+
 st.markdown("#### 시장 시세")
 
 # 시세 타일 — 괄호 = 그 숫자가 몇 시 시세인지 (한국시간, 분 단위)
@@ -1143,15 +1288,8 @@ with t_lag:
 
 # ---------------------------------------------------------------- CPI 서프라이즈
 with t_surp:
-    raw = safe(nowcast_raw, "나우캐스트 기록")
-    dpx = safe(daily_px_since_2013, "발표일 시세")
-    if raw is not None and dpx is not None:
-        sp = history.surprises(raw)
-        for t in LONG_ASSETS:
-            sp[t] = history.release_reaction(dpx[t].dropna(), sp["release"]).values
-        tnx = dpx["^TNX"].dropna()
-        sp["10년물"] = [(tnx.iloc[tnx.index.get_loc(d)] - tnx.iloc[tnx.index.get_loc(d) - 1]) * 100
-                       if d in tnx.index else None for d in sp["release"]]
+    sp = safe(surprise_frame, "CPI 서프라이즈 기록")
+    if sp is not None:
 
         st.markdown("CPI 발표 때마다 **발표 직전 예상치**(클리블랜드 연준 나우캐스트)와 **실제치**의 차이, "
                     "그리고 그날 시장 반응입니다. 시장은 숫자 자체보다 **예상과의 차이**에 반응합니다.")

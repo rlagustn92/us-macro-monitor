@@ -74,3 +74,24 @@ def test_surprises_and_reaction():
 
     px = pd.Series([100.0, 102.0], index=pd.to_datetime(["2026-01-12", "2026-01-13"]))
     assert round(release_reaction(px, [pd.Timestamp(2026, 1, 13)]).iloc[0], 1) == 2.0
+
+
+def test_latest_actual_and_path():
+    from history import latest_actual, nowcast_path
+
+    def series(name, pts):
+        return {"seriesname": name, "data": [
+            {"value": str(v), "tooltext": f"{name}{{br}}{d}{{br}}{v}{{br}}"} for d, v in pts]}
+    js = [
+        {"chart": {"subcaption": "2026-7"}, "dataset": [
+            series("Actual Core PCE Inflation", [("08/29", 3.34)])]},
+        {"chart": {"subcaption": "2026-8"}, "dataset": [
+            series("Actual Core PCE Inflation", [("09/30", 3.01)]),
+            series("CPI Inflation", [("08/01", 3.30), ("09/10", 3.38)])]},
+        {"chart": {"subcaption": "2026-9"}, "dataset": [
+            series("Actual Core PCE Inflation", []),
+            series("CPI Inflation", [("09/01", 3.45), ("10/02", 3.60)])]},
+    ]
+    assert latest_actual(js) == (pd.Period("2026-08", "M"), 3.01)
+    assert nowcast_path(js, "2026-9") == [("09/01", 3.45), ("10/02", 3.60)]
+    assert nowcast_path(js, "2026-12") == []
