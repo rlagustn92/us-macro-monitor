@@ -257,7 +257,7 @@ def yf_daily():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def yf_intraday():
-    df = _close(yf.download(list(RT_YIELDS) + [WTI], period="5d", interval="5m",
+    df = _close(yf.download(list(RT_YIELDS) + [WTI, SOX], period="5d", interval="5m",
                             progress=False, auto_adjust=False))
     idx = pd.to_datetime(df.index)
     df.index = (idx.tz_localize("UTC") if idx.tz is None else idx).tz_convert(KST)
@@ -496,16 +496,19 @@ def _fred_key():
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def release_dates(key):
-    """다음 CPI / 고용보고서 발표일. FRED API 키가 있을 때만 (BLS 일정 페이지는 봇 차단).
-    FRED release id: 10 = CPI, 50 = Employment Situation"""
-    out = {}
+    """CPI / 고용보고서 발표일. FRED API 키가 있을 때만 (BLS 일정 페이지는 봇 차단).
+    FRED release id: 10 = CPI, 50 = Employment Situation
+    반환: {"CPI": 다음 발표일, "JOBS": ..., "CPI_last": 직전 발표일, "JOBS_last": ...}"""
+    out, today_ = {}, date.today()
     for name, rid in (("CPI", 10), ("JOBS", 50)):
         r = json.loads(_get(
             "https://api.stlouisfed.org/fred/release/dates"
             f"?release_id={rid}&api_key={key}&file_type=json&sort_order=asc"
-            f"&include_release_dates_with_no_data=true&realtime_start={date.today()}"))
-        ds = [date.fromisoformat(x["date"]) for x in r.get("release_dates", [])]
-        out[name] = next((d for d in ds if d >= date.today()), None)
+            f"&include_release_dates_with_no_data=true"
+            f"&realtime_start={today_ - timedelta(days=120)}"))
+        ds = sorted(date.fromisoformat(x["date"]) for x in r.get("release_dates", []))
+        out[name] = next((d for d in ds if d >= today_), None)
+        out[name + "_last"] = next((d for d in reversed(ds) if d < today_), None)
     return out
 
 
@@ -602,7 +605,7 @@ with sb.expander("다음 이벤트 일정"):
     ev_jobs = st.date_input("다음 고용보고서", value=(rel or {}).get("JOBS") or jobs)
     ev_fomc = st.date_input("다음 FOMC 결정", value=next((d for d in fomc if d >= today), None))
     st.caption("FOMC: 연준 공식 일정에서 자동  \n" + (
-        "CPI·고용보고서: FRED에서 자동" if rel and all(rel.values()) else
+        "CPI·고용보고서: FRED에서 자동" if rel and rel.get("CPI") and rel.get("JOBS") else
         "CPI·고용보고서: FRED API 키를 넣으면 자동 (없으면 고용은 첫째 금요일로 추정, "
         "CPI는 직접 입력)"))
 
@@ -792,22 +795,90 @@ st.caption(f"데이터 기준 · CPI {cpi_m} ({msrc}) · 10년물 {y10:.2f}% ({y
            f"시세 받은 시각 {fetched_at():%m/%d %H:%M} · 1시간마다 갱신 · 투자 권유 아님")
 st.markdown("#### 시장 시세")
 
-# 시세 타일
-cols = st.columns(4) + st.columns(4)   # 4개씩 두 줄 (8개 한 줄은 숫자가 잘림)
-if daily is not None:
-    for i, (t, name) in enumerate(RT_YIELDS.items()):
-        s = daily[t].dropna()
-        cols[i].metric(f"미국채 {name}", f"{s.iloc[-1]:.3f}%", bp(s.iloc[-1] - s.iloc[-2]),
-                       delta_color="off", border=True)
-    for col, t, lab in ((cols[6], WTI, "WTI ($)"), (cols[7], SOX, "반도체지수 SOX")):
-        s = daily[t].dropna()
-        col.metric(lab, f"{s.iloc[-1]:,.2f}", f"{(s.iloc[-1] / s.iloc[-2] - 1) * 100:+.2f}%",
+# 시세 타일 — 괄호 = 그 숫자가 몇 시 시세인지 (한국시간, 분 단위)
+intra_q = safe(yf_intraday, "장중 시세", quiet=True)
+
+
+def quote(t):
+    """(현재값, 직전 거래일 종가, 시각 문구). 5분봉 마지막 체결이 우선이고 숫자도 그 시각 값.
+    5분봉이 없으면 일봉 종가."""
+    d = daily[t].dropna() if daily is not None and t in daily else None
+    if intra_q is not None and t in intra_q and intra_q[t].notna().any():
+        s = intra_q[t].dropna()
+        ts = s.index[-1]
+        ny = ts.tz_convert("America/New_York")
+        # 원유 선물은 18:00(뉴욕)부터 다음 날 거래일로 침
+        sess = ny.date() + timedelta(days=1 if t == WTI and ny.hour >= 18 else 0)
+        prev = None
+        if d is not None:
+            # 주말 날짜 행 제외: Yahoo가 일요일 저녁 선물 거래를 '일요일' 일봉으로 넣기도 함
+            before = d[(d.index.date < sess) & (d.index.dayofweek < 5)]
+            prev = before.iloc[-1] if len(before) else None
+        return s.iloc[-1], prev, f"{ts:%m/%d %H:%M}"
+    if d is not None and len(d) >= 2:
+        return d.iloc[-1], d.iloc[-2], f"{d.index[-1]:%m/%d} 종가"
+    return None
+
+
+def release_kst(d):
+    """미국 경제지표 발표 시각(동부 08:30) -> 한국시간. 서머타임 자동 반영."""
+    return pd.Timestamp(d.year, d.month, d.day, 8, 30, tz="America/New_York").tz_convert(KST)
+
+
+# 1줄: 금리 4종 / 2줄: CPI · 다음 CPI 예상 · 실업률 / 3줄: WTI · 반도체
+# (괄호에 시각이 붙어 라벨이 길어서 2·3줄은 칸을 넓게)
+row1, row2, row3 = st.columns(4), st.columns(3), st.columns(2)
+cols = row1 + [row2[0], row2[2], row3[0], row3[1]]   # 4=CPI 5=실업률 6=WTI 7=SOX
+for i, (t, name) in enumerate(RT_YIELDS.items()):
+    q = quote(t)
+    if q:
+        v, p, when = q
+        cols[i].metric(f"미국채 {name} ({when})", f"{v:.3f}%",
+                       bp(v - p) if p is not None else None, delta_color="off", border=True)
+
+# 클리블랜드 연준 다음 CPI 예상 (매일 갱신, 분 단위 시각은 공개 안 됨 -> 날짜까지)
+if nc:
+    row2[1].metric(
+        f"다음 CPI 예상 · 클리블랜드 연준 ({target:%Y.%m}분 · {nc[2]} 기준)", f"{nc[0]:.2f}%",
+        f"{nc[0] - cpi_yoy.iloc[-1]:+.2f}%p vs 최신 CPI", delta_color="off", border=True,
+        help=f"근원 CPI 예상 {nc[1]:.2f}% · 출처: Cleveland Fed Inflation Nowcasting (매 영업일 갱신)")
+else:
+    row2[1].metric(f"다음 CPI 예상 · 클리블랜드 연준 ({target:%Y.%m}분)", "최신 전망 없음",
+                   "아직 안 나왔거나 받아오지 못함", delta_color="off", border=True)
+
+for col, t, lab in ((cols[6], WTI, "WTI $"), (cols[7], SOX, "반도체 SOX")):
+    q = quote(t)
+    if q:
+        v, p, when = q
+        col.metric(f"{lab} ({when})", f"{v:,.2f}",
+                   f"{(v / p - 1) * 100:+.2f}%" if p is not None else None,
                    delta_color="off", border=True)
-cols[4].metric(f"CPI 전년比 ({cpi_m})", f"{cpi_yoy.iloc[-1]:.1f}%",
+
+# CPI · 실업률: 월간 지표라 분 단위 '시세' 대신 발표 시각
+cpi_rel = (rel or {}).get("CPI_last")
+if cpi_rel is None and hasattr(cpi_yoy.index[-1], "strftime"):
+    sp_all = safe(lambda: history.surprises(nowcast_raw()), "CPI 발표일", quiet=True)
+    if sp_all is not None:
+        hit = sp_all[sp_all.target == pd.Period(cpi_yoy.index[-1], "M")]
+        cpi_rel = hit.release.iloc[-1].date() if len(hit) else None
+cpi_when = (f"{cpi_m}분 · {release_kst(cpi_rel):%m/%d %H:%M} 발표" if cpi_rel
+            else f"{cpi_m}분" if cpi_m != "수동" else "수동 입력")
+cols[4].metric(f"CPI 전년比 ({cpi_when})", f"{cpi_yoy.iloc[-1]:.1f}%",
                f"{cpi_yoy.iloc[-1] - cpi_yoy.iloc[-2]:+.1f}%p", delta_color="off", border=True)
-um = f" ({unrate.index[-1]:%Y.%m})" if hasattr(unrate.index[-1], "strftime") else ""
-cols[5].metric(f"실업률{um}", f"{unrate.iloc[-1]:.1f}%",
+
+if hasattr(unrate.index[-1], "strftime"):
+    um_ = unrate.index[-1]
+    job_rel, est = (rel or {}).get("JOBS_last"), ""
+    if job_rel is None:   # 키 없으면 '다음 달 첫째 금요일'로 추정
+        nm_ = (um_ + pd.DateOffset(months=1)).date()
+        job_rel, est = first_fri(nm_.year, nm_.month), " 추정"
+    u_when = f"{um_:%Y.%m}분 · {release_kst(job_rel):%m/%d %H:%M} 발표{est}"
+else:
+    u_when = "수동 입력"
+cols[5].metric(f"실업률 ({u_when})", f"{unrate.iloc[-1]:.1f}%",
                f"{unrate.iloc[-1] - unrate.iloc[-2]:+.1f}%p", delta_color="off", border=True)
+st.caption("괄호 = 그 숫자가 몇 시 시세인지 (한국시간, 5분봉 마지막 체결 · Yahoo는 원래 10~15분 늦게 들어옴) · "
+           "CPI·실업률은 월 1회 지표라 발표 시각 · 변화는 직전 거래일 종가 대비")
 
 (t_signal, t_lag, t_surp, t_rate, t_infl, t_semi, t_oil, t_tri, t_help) = st.tabs(
     ["🧭 판정 근거", "📊 시차 분석", "🎯 CPI 서프라이즈", "국채 금리", "물가·고용", "반도체",
