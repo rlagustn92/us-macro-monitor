@@ -735,8 +735,10 @@ with hero_r:
             ey - y10, "{:+.2f}%p",
             [(-0.5, "serious", "채권 우위"), (0.5, "warning", "비슷"), (99, "good", "주식 우위")],
             -3.0, 3.0, note=f"주식 {ey:.2f}% vs 국채 {y10:.2f}% (PER {fwd_per:.1f})"))
-    st.markdown('<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));'
-                f'gap:10px">{"".join(g)}</div>', unsafe_allow_html=True)
+    # PC에선 2x2 고정 (3+1로 어긋나지 않게), 폰에선 한 줄
+    st.markdown('<style>.gauges{display:grid;grid-template-columns:1fr 1fr;gap:10px}'
+                '@media (max-width:640px){.gauges{grid-template-columns:1fr}}</style>'
+                f'<div class="gauges">{"".join(g)}</div>', unsafe_allow_html=True)
 
 # ③ 뭐가 바뀌면 달라지나 — 다음 CPI 결과별 + 단계별 조건
 outs = mr.next_cpi_outcomes(ind, th)
@@ -1002,6 +1004,9 @@ with t_lag:
                 "비고": "잠정 (진행 중)" if p == cur else ("" if r["complete"] else "24개월 미경과"),
             })
         tbl = pd.DataFrame(rows)
+        for col in ["주가 고점 (정점 대비)", "바닥까지 (개월)", "정점 대비 최저", "6개월 뒤", "12개월 뒤"]:
+            if col in tbl:   # 아직 안 지난 기간(None)이 'None' 글자로 보이지 않게 숫자로
+                tbl[col] = pd.to_numeric(tbl[col], errors="coerce")
         pct = st.column_config.NumberColumn(format="%+.1f%%")
         st.dataframe(tbl, hide_index=True, width="stretch", column_config={
             "정점 값": st.column_config.NumberColumn(format="%.2f%%"),
